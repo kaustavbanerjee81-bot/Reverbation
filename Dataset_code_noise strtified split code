@@ -1,0 +1,312 @@
+#Dataset and  Noise  split
+#import  of  all libraries
+import matplotlib.pyplot as plt
+import  torch
+import numpy as np
+import pandas  as pd
+import seaborn as  sns
+from google.colab  import drive
+import os
+# ════════════════════════════════════════════════════════
+# RUN THIS FIRST — CLEAR OLD FILES
+# ════════════════════════════════════════════════════════
+import shutil, os
+
+LOCAL_WAV_SPLIT = '/content/SAMPLE_WAV_SPLIT'
+LOCAL_PHN_SPLIT = '/content/SAMPLE_PHN_SPLIT'
+
+for folder in [LOCAL_WAV_SPLIT, LOCAL_PHN_SPLIT]:
+    if os.path.exists(folder):
+        shutil.rmtree(folder)      # ← delete old
+        os.makedirs(folder)        # ← create fresh
+        print(f"✅ Cleared : {folder}")
+    else:
+        os.makedirs(folder)
+        print(f"✅ Created : {folder}")
+
+print("\n🎉 Fresh start! Now rerun Cell 3 → Cell 4 → Cell 5 → Cell 6 → Cell 7")
+from google.colab import drive
+drive.mount('/content/drive')
+  # ════════════════════════════════════════════════════════
+# CELL 2 — IMPORTS & PATHS
+# ════════════════════════════════════════════════════════
+import os, shutil
+import numpy as np
+import pandas as pd
+
+TIMIT_WAV = '/content/drive/MyDrive/DATASET_IISC/TIMIT_LDC93S1/TIMIT_WAV'
+TIMIT_PHN = '/content/drive/MyDrive/DATASET_IISC/TIMIT_LDC93S1/TIMIT'
+
+LOCAL_WAV_SPLIT = '/content/SAMPLE_WAV_SPLIT'
+LOCAL_PHN_SPLIT = '/content/SAMPLE_PHN_SPLIT'
+
+DRIVE_WAV_SPLIT = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_WAV_SPLIT'
+DRIVE_PHN_SPLIT = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_PHN_SPLIT'
+
+# ── SAMPLE SIZE ───────────────────────────────────────
+N_SAMPLE = 10   # ← change this anytime!
+
+for f in [LOCAL_WAV_SPLIT, LOCAL_PHN_SPLIT]:
+    os.makedirs(f, exist_ok=True)
+
+print("✅ Paths ready!")
+# ════════════════════════════════════════════════════════
+# CELL 3 — PICK 10 SPEAKERS IN ORIGINAL RATIO
+# ════════════════════════════════════════════════════════
+train_path = os.path.join(TIMIT_WAV, 'TRAIN')
+
+all_speakers = []
+for dr in sorted(os.listdir(train_path)):
+    dr_path = os.path.join(train_path, dr)
+    if not os.path.isdir(dr_path): continue
+    for speaker in sorted(os.listdir(dr_path)):
+        sp_path = os.path.join(dr_path, speaker)
+        if not os.path.isdir(sp_path): continue
+        gender = 'female' if speaker.upper().startswith('F') else \
+                 'male'   if speaker.upper().startswith('M') else 'unknown'
+        all_speakers.append({
+            'dr'     : dr,
+            'speaker': speaker,
+            'gender' : gender
+        })
+
+df = pd.DataFrame(all_speakers)
+
+# ── CALCULATE ORIGINAL RATIO ──────────────────────────
+total        = len(df)
+n_female     = (df['gender']=='female').sum()
+n_male       = (df['gender']=='male').sum()
+female_ratio = n_female / total
+male_ratio   = n_male   / total
+
+print(f"📊 Original Distribution:")
+print(f"   Total   : {total}")
+print(f"   Female  : {n_female} ({female_ratio*100:.1f}%)")
+print(f"   Male    : {n_male}   ({male_ratio*100:.1f}%)")
+
+# ── APPLY RATIO TO SAMPLE ─────────────────────────────
+n_f_sample = max(1, round(female_ratio * N_SAMPLE))  # 3
+n_m_sample = N_SAMPLE - n_f_sample                   # 7
+
+print(f"\n📊 Sample of {N_SAMPLE} speakers:")
+print(f"   Female  : {n_f_sample} ({n_f_sample/N_SAMPLE*100:.1f}%)")
+print(f"   Male    : {n_m_sample} ({n_m_sample/N_SAMPLE*100:.1f}%)")
+
+# ── RANDOM SAMPLE ─────────────────────────────────────
+np.random.seed(42)
+female_sample = df[df['gender']=='female'].sample(n=n_f_sample, random_state=42)
+male_sample   = df[df['gender']=='male'].sample(n=n_m_sample,   random_state=42)
+sample_df     = pd.concat([female_sample, male_sample]).reset_index(drop=True)
+
+print(f"\n📋 Speakers selected:")
+for _, row in sample_df.iterrows():
+    print(f"   {row['gender']:6s} | {row['dr']} | {row['speaker']}")
+# ════════════════════════════════════════════════════════
+# CELL 4 — STRATIFIED 80/10/10 PRESERVING RATIO
+# ════════════════════════════════════════════════════════
+np.random.seed(42)
+train_list, val_list, test_list = [], [], []
+
+for gender in ['female', 'male']:
+    group = sample_df[sample_df['gender']==gender].reset_index(drop=True)
+    idx   = np.random.permutation(len(group))
+
+    n_val   = max(1, round(0.1 * len(group)))
+    n_test  = max(1, round(0.1 * len(group)))
+    n_train = len(group) - n_val - n_test
+
+    train_list.append(group.iloc[idx[:n_train]])
+    val_list.append(  group.iloc[idx[n_train:n_train + n_val]])
+    test_list.append( group.iloc[idx[n_train + n_val:]])
+
+train_df = pd.concat(train_list).reset_index(drop=True)
+val_df   = pd.concat(val_list).reset_index(drop=True)
+test_df  = pd.concat(test_list).reset_index(drop=True)
+
+print("📊 Stratified Split (Original Ratio):")
+print(f"\n{'─'*50}")
+print(f"   {'Split':8s} {'Total':>6} {'Female':>8} {'Male':>6} "
+      f"{'F%':>6} {'M%':>6}")
+print(f"{'─'*50}")
+for name, sdf in [('train', train_df),
+                   ('val',   val_df),
+                   ('test',  test_df)]:
+    f  = (sdf['gender']=='female').sum()
+    m  = (sdf['gender']=='male').sum()
+    fp = f/len(sdf)*100 if len(sdf)>0 else 0
+    mp = m/len(sdf)*100 if len(sdf)>0 else 0
+    print(f"   {name:8s} {len(sdf):>6}  {f:>6}  {m:>6} "
+          f"{fp:>5.1f}% {mp:>5.1f}%")
+print(f"{'─'*50}")
+print(f"\n   Original → Female: {female_ratio*100:.1f}% "
+      f"Male: {male_ratio*100:.1f}%")
+
+# ── MAP SPEAKER TO SPLIT ──────────────────────────────
+speaker_to_split = {}
+for _, row in train_df.iterrows(): speaker_to_split[row['speaker']] = 'train'
+for _, row in val_df.iterrows():   speaker_to_split[row['speaker']] = 'val'
+for _, row in test_df.iterrows():  speaker_to_split[row['speaker']] = 'test'
+
+print(f"\n📋 Speaker assignments:")
+for spk, spl in speaker_to_split.items():
+    print(f"   {spk} → {spl}")
+  # ════════════════════════════════════════════════════════
+# CELL 5 — COPY TIMIT_WAV SAMPLE LOCALLY ⚡
+# ════════════════════════════════════════════════════════
+print("🔄 Copying TIMIT_WAV sample...")
+
+for _, row in sample_df.iterrows():
+    dr, speaker = row['dr'], row['speaker']
+    split_name  = speaker_to_split[speaker]
+
+    src = os.path.join(TIMIT_WAV, 'TRAIN', dr, speaker)
+    dst = os.path.join(LOCAL_WAV_SPLIT, split_name, dr, speaker)
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst): shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    print(f"   ✅ {split_name:5s} | {dr} | {speaker} "
+          f"| {len(os.listdir(src))} files")
+
+print("\n✅ TIMIT_WAV sample copied!")
+# ════════════════════════════════════════════════════════
+# FIXED CELL 6 — COPY ONLY PHN/WRD/TXT (NO WAV)
+# ════════════════════════════════════════════════════════
+import os, shutil
+
+TIMIT_PHN       = '/content/drive/MyDrive/DATASET_IISC/TIMIT_LDC93S1/TIMIT'
+LOCAL_PHN_SPLIT = '/content/SAMPLE_PHN_SPLIT'
+
+print("🔄 Copying TIMIT PHN/WRD/TXT only (NO .WAV)...\n")
+
+success = 0
+failed  = 0
+
+for _, row in sample_df.iterrows():
+    dr, speaker = row['dr'], row['speaker']
+    split_name  = speaker_to_split[speaker]
+
+    src = os.path.join(TIMIT_PHN, 'TRAIN', dr, speaker)
+    dst = os.path.join(LOCAL_PHN_SPLIT, split_name, dr, speaker)
+
+    if not os.path.exists(src):
+        print(f"❌ SOURCE missing : {src}")
+        failed += 1
+        continue
+
+    os.makedirs(dst, exist_ok=True)
+
+    # ── COPY ONLY PHN WRD TXT ── skip WAV ────────────
+    copied_files = []
+    for fname in os.listdir(src):
+        if fname.upper().endswith('.WAV'):
+            continue                          # ❌ skip WAV
+        shutil.copy2(
+            os.path.join(src, fname),
+            os.path.join(dst, fname)
+        )
+        copied_files.append(fname)
+
+    print(f"✅ {split_name:5s} | {dr} | {speaker} "
+          f"| {len(copied_files)} files "
+          f"→ {copied_files[:3]}")
+    success += 1
+
+print(f"\n📊 Results:")
+print(f"   ✅ Success : {success}")
+print(f"   ❌ Failed  : {failed}")
+
+# ── VERIFY ───────────────────────────────────────────
+print(f"\n📁 PHN Split contents now:")
+for split in ['train', 'val', 'test']:
+    sp = os.path.join(LOCAL_PHN_SPLIT, split)
+    if not os.path.exists(sp):
+        print(f"   ⚠️  {split} missing!")
+        continue
+    total_spk   = 0
+    total_files = 0
+    wav_count   = 0
+    for dr in os.listdir(sp):
+        dr_path = os.path.join(sp, dr)
+        if not os.path.isdir(dr_path): continue
+        for spk in os.listdir(dr_path):
+            spk_path = os.path.join(dr_path, spk)
+            if not os.path.isdir(spk_path): continue
+            total_spk   += 1
+            files        = os.listdir(spk_path)
+            total_files += len(files)
+            wav_count   += sum(1 for f in files
+                               if f.upper().endswith('.WAV'))
+    print(f"   {split:8s} → {total_spk} speakers | "
+          f"{total_files} files | "
+          f"WAV files: {wav_count} ← should be 0! ✅")
+# ════════════════════════════════════════════════════════
+# SIMPLE PRINT — OUTPUT & DISTRIBUTION
+# ════════════════════════════════════════════════════════
+#so we make  two paths TIMIT_WAV AND TIMIT
+import os
+
+LOCAL_WAV_SPLIT = '/content/SAMPLE_WAV_SPLIT'
+LOCAL_PHN_SPLIT = '/content/SAMPLE_PHN_SPLIT'
+
+#WE SPLIT IT INTO TRAIN TEST AND  VAL
+
+for split in ['train', 'val', 'test']:
+    print(f"\n{'═'*40}")
+    print(f"  {split.upper()}")
+    print(f"{'═'*40}")
+
+    for local, name in [(LOCAL_WAV_SPLIT, 'WAV'),
+                        (LOCAL_PHN_SPLIT, 'PHN')]:
+        sp = os.path.join(local, split)
+        if not os.path.exists(sp):
+            print(f"  ⚠️  {name} missing!")
+            continue
+
+        total_spk    = 0
+        total_files  = 0
+        male         = 0
+        female       = 0
+
+        for dr in sorted(os.listdir(sp)):
+            dr_path = os.path.join(sp, dr)
+            if not os.path.isdir(dr_path): continue
+            for spk in sorted(os.listdir(dr_path)):
+                spk_path = os.path.join(dr_path, spk)
+                if not os.path.isdir(spk_path): continue
+                total_spk   += 1
+                total_files += len(os.listdir(spk_path))
+                if spk.upper().startswith('F'): female += 1
+                else:                           male   += 1
+
+        print(f"\n  📁 {name}")
+        print(f"     Speakers : {total_spk}")
+        print(f"     Female   : {female}")
+        print(f"     Male     : {male}")
+        print(f"     Files    : {total_files}")
+# ════════════════════════════════════════════════════════
+# PRINT EXACT NUMBERS FIRST
+# ════════════════════════════════════════════════════════
+
+print("📊 ORIGINAL SAMPLE (10 speakers):")
+print(f"   Female : {(sample_df['gender']=='female').sum()}")
+print(f"   Male   : {(sample_df['gender']=='male').sum()}")
+print(f"   Total  : {len(sample_df)}")
+
+print(f"\n📊 EXPECTED (perfect stratification):")
+print(f"   Every split should have:")
+print(f"   Female : {female_ratio*100:.1f}%")
+print(f"   Male   : {male_ratio*100:.1f}%")
+
+print(f"\n📊 ACTUAL RESULT:")
+for name, sdf in [('Train', train_df),
+                   ('Val',   val_df),
+                   ('Test',  test_df)]:
+    f  = (sdf['gender']=='female').sum()
+    m  = (sdf['gender']=='male').sum()
+    fp = f/len(sdf)*100
+    mp = m/len(sdf)*100
+    print(f"\n   {name}:")
+    print(f"   Female : {f} speakers ({fp:.1f}%)")
+    print(f"   Male   : {m} speakers ({mp:.1f}%)")
+    print(f"   Total  : {len(sdf)}")
