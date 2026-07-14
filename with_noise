@@ -1,0 +1,3555 @@
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+feature_names = [
+    "ZCR",
+    "Mean Autocorrelation",
+    "Spectral Centroid (Hz)",
+    "Spectral Rolloff (Hz)",
+    "Spectral Entropy",
+    "Spectral Flatness"
+]
+
+fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+axes = axes.flatten()
+
+for i, name in enumerate(feature_names):
+
+    ax = axes[i]
+
+    ax.hist(
+        X_train[y_train == 0, i],
+        bins=30,
+        alpha=0.6,
+        label="Clean",
+        color="steelblue"
+    )
+
+    ax.hist(
+        X_train[y_train == 1, i],
+        bins=30,
+        alpha=0.6,
+        label="Reverberant",
+        color="tomato"
+    )
+
+    ax.set_xlabel(name)
+    ax.set_ylabel("Count")
+    ax.set_title(f"{name}: Clean vs Reverberant")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+fig.suptitle("Feature Distributions — Clean vs Reverberant (Train set)",
+             fontsize=14, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+# ════════════════════════════════════════════════════════
+# CELL 4A — CLEAR FEATURE FOLDER
+# ════════════════════════════════════════════════════════
+
+FEAT_DIR = '/content/drive/MyDrive/DATASET_IISC/features_zcr_meanac_sc_sro_se_sf_6dim'
+if os.path.exists(FEAT_DIR): shutil.rmtree(FEAT_DIR)
+os.makedirs(FEAT_DIR, exist_ok=True)
+print(f"✅ Fresh feature folder: {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4B — STEP 4: COMPUTE 6-DIM FEATURE VECTOR
+#
+# ALL SIX FEATURES COMPUTED ON 1-BIT QUANTIZED SIGNAL
+#
+# Feature vector — 6 dimensions:
+#
+#   Index  0  :  ZCR
+#   Index  1  :  mean_AC       = mean( R(1), R(2), ..., R(4) )
+#   Index  2  :  spectral_centroid
+#   Index  3  :  spectral_rolloff (85%)
+#   Index  4  :  spectral_entropy
+#   Index  5  :  spectral_flatness
+#
+# ── ZCR ──────────────────────────────────────────────
+#   ZCR = number_of_sign_changes / (T - 1)
+#   sign(0) treated as +1
+#
+# ── Autocorrelation ──────────────────────────────────
+#   R(k) = Σ x(t)*x(t+k) / Σ x(t)^2     k = 1..4
+#   mean_AC = mean( R(1)..R(4) )  →  1 scalar
+#
+# ── Spectral Centroid ─────────────────────────────────
+#   Centroid = Σ_k [ f_k * |X(k)| ] / Σ_k |X(k)|
+#   f_k = k * sr / N   (frequency bin centres)
+#   Computed via np.fft.rfft on 1-bit quantized signal
+#
+# ── Spectral Roll-off (85%) ───────────────────────────
+#   Frequency below which 85% of cumulative spectral
+#   magnitude is contained.
+#   Rolloff = f_k  where  Σ_{j<=k} |X(j)| >= 0.85 * Σ_j |X(j)|
+#
+# ── Spectral Entropy ──────────────────────────────────
+#   Power spectrum treated as a probability distribution.
+#   P(k)  = |X(k)|^2 / Σ_k |X(k)|^2        (normalised PSD)
+#   SE    = -Σ_k P(k) * log2( P(k) + ε )   (bits)
+#   Normalised: SE_norm = SE / log2(N_bins)  ∈ [0, 1]
+#     → 0 : energy concentrated in one bin (tonal / clean)
+#     → 1 : energy spread uniformly (noise-like / reverberant)
+#
+# ── Spectral Flatness ─────────────────────────────────
+#   Ratio of geometric mean to arithmetic mean of |X(k)|^2.
+#   SF = geometric_mean(|X(k)|^2) / arithmetic_mean(|X(k)|^2)
+#      = exp( mean(log(|X(k)|^2 + ε)) ) / mean(|X(k)|^2)
+#   SF ∈ [0, 1]
+#     → 0 : tonal / sparse spectrum (clean speech)
+#     → 1 : flat / noise-like spectrum (reverberant)
+#
+#   Both SE and SF use |X(k)|^2 (power), ε=1e-12 for log safety.
+#   ALL features computed on 1-bit QUANTIZED signal.
+# ════════════════════════════════════════════════════════
+
+N_AC_LAGS   = 3
+N_FEATURES  = 6     # [ZCR, mean_AC, SC, SRO, Spec_Entropy, Spec_Flatness]
+
+ROLLOFF_PERCENT = 0.85
+LOG_EPS         = 1e-12        # guard against log(0)
+
+
+def compute_zcr(signal):
+    signs = np.sign(signal)
+    signs[signs == 0] = 1
+    return float(np.sum(np.diff(signs) != 0) / (len(signal) - 1))
+
+
+def compute_mean_autocorr(signal, n_lags=N_AC_LAGS):
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    if energy == 0.0:
+        return 0.0
+    ac = np.array(
+        [np.sum(signal[:-k] * signal[k:]) / energy
+         for k in range(1, n_lags + 1)]
+    )
+    return float(np.mean(ac))
+
+
+def compute_spectral_centroid(signal, sr):
+    """
+    Spectral Centroid computed from FFT magnitude spectrum.
+      Centroid = Σ_k [ f_k * |X(k)| ] / Σ_k |X(k)|
+    Returns centroid frequency in Hz.
+    Returns 0.0 on zero-energy signal.
+    """
+    signal    = np.asarray(signal, dtype=np.float64)
+    N         = len(signal)
+    mag       = np.abs(np.fft.rfft(signal))
+    total_mag = np.sum(mag)
+    if total_mag == 0.0:
+        return 0.0
+    freqs    = np.fft.rfftfreq(N, d=1.0 / sr)
+    centroid = float(np.sum(freqs * mag) / total_mag)
+    return centroid
+
+
+def compute_spectral_rolloff(signal, sr, roll_percent=ROLLOFF_PERCENT):
+    """
+    Spectral Roll-off: frequency below which `roll_percent` of the
+    cumulative spectral magnitude is contained.
+      Rolloff = f_k  where  Σ_{j<=k} |X(j)| >= roll_percent * Σ_j |X(j)|
+    Returns rolloff frequency in Hz.
+    Returns 0.0 on zero-energy signal.
+    """
+    signal    = np.asarray(signal, dtype=np.float64)
+    N         = len(signal)
+    mag       = np.abs(np.fft.rfft(signal))
+    total_mag = np.sum(mag)
+    if total_mag == 0.0:
+        return 0.0
+    freqs       = np.fft.rfftfreq(N, d=1.0 / sr)
+    cum_mag     = np.cumsum(mag)
+    threshold   = roll_percent * total_mag
+    rolloff_idx = np.searchsorted(cum_mag, threshold)
+    rolloff_idx = min(rolloff_idx, len(freqs) - 1)
+    return float(freqs[rolloff_idx])
+
+
+def compute_spectral_entropy(signal):
+    """
+    Normalised Spectral Entropy (power-spectrum based).
+      P(k)    = |X(k)|^2 / Σ_k |X(k)|^2        (normalised PSD)
+      SE      = -Σ_k P(k) * log2( P(k) + ε )
+      SE_norm = SE / log2(N_bins)                ∈ [0, 1]
+    Returns 0.0 on zero-energy signal.
+    Low  → tonal / spectrally sparse  (typical of clean speech)
+    High → noise-like / diffuse       (typical of reverberation)
+    """
+    signal    = np.asarray(signal, dtype=np.float64)
+    power     = np.abs(np.fft.rfft(signal)) ** 2
+    total_pwr = np.sum(power)
+    if total_pwr == 0.0:
+        return 0.0
+    P       = power / total_pwr                            # normalised PSD
+    n_bins  = len(P)
+    entropy = -np.sum(P * np.log2(P + LOG_EPS))           # raw entropy (bits)
+    return float(entropy / np.log2(n_bins))                # normalised ∈ [0,1]
+
+
+def compute_spectral_flatness(signal):
+    """
+    Spectral Flatness (Wiener entropy) on power spectrum.
+      SF = exp( mean(log(|X(k)|^2 + ε)) ) / mean(|X(k)|^2)
+    SF ∈ [0, 1].
+    Returns 0.0 on zero-energy signal.
+    Low  → tonal / peaked spectrum    (typical of clean speech)
+    High → flat  / noise-like         (typical of reverberation)
+    """
+    signal    = np.asarray(signal, dtype=np.float64)
+    power     = np.abs(np.fft.rfft(signal)) ** 2
+    total_pwr = np.sum(power)
+    if total_pwr == 0.0:
+        return 0.0
+    arith_mean = np.mean(power)
+    geom_mean  = np.exp(np.mean(np.log(power + LOG_EPS)))
+    return float(geom_mean / (arith_mean + LOG_EPS))
+
+
+def compute_features(signal_q, sr):
+    zcr      = compute_zcr(signal_q)
+    mean_ac  = compute_mean_autocorr(signal_q, N_AC_LAGS)
+    sc       = compute_spectral_centroid(signal_q, sr)
+    sro      = compute_spectral_rolloff(signal_q, sr, ROLLOFF_PERCENT)
+    se       = compute_spectral_entropy(signal_q)
+    sf       = compute_spectral_flatness(signal_q)
+    return np.array([zcr, mean_ac, sc, sro, se, sf], dtype=np.float64)
+
+
+def process_feature_split(npy_dir, split_name):
+    all_files    = sorted(os.listdir(npy_dir))
+    clean_files  = [f for f in all_files if f.endswith('_clean_q.npy')]
+    reverb_files = [f for f in all_files if f.endswith('_reverb_q.npy')]
+
+    assert len(clean_files) == len(reverb_files), \
+        f"❌ Mismatch: {len(clean_files)} clean vs {len(reverb_files)} reverb"
+
+    print(f"\n  {split_name.upper()} — {len(clean_files)} pairs")
+    print(f"  {'-'*105}")
+
+    X, y = [], []
+    for cf, rf in zip(clean_files, reverb_files):
+        clean_q  = np.load(os.path.join(npy_dir, cf))
+        reverb_q = np.load(os.path.join(npy_dir, rf))
+
+        feat_c = compute_features(clean_q,  SR)
+        feat_r = compute_features(reverb_q, SR)
+
+        X.extend([feat_c, feat_r])
+        y.extend([0, 1])
+
+        print(f"  {cf[:28]:28s}  "
+              f"ZCR={feat_c[0]:.4f}/{feat_r[0]:.4f}  "
+              f"mAC={feat_c[1]:.4f}/{feat_r[1]:.4f}  "
+              f"SC={feat_c[2]:.1f}/{feat_r[2]:.1f}Hz  "
+              f"SRO={feat_c[3]:.1f}/{feat_r[3]:.1f}Hz  "
+              f"SE={feat_c[4]:.4f}/{feat_r[4]:.4f}  "
+              f"SF={feat_c[5]:.4f}/{feat_r[5]:.4f}")
+
+    X = np.array(X, dtype=np.float64)
+    y = np.array(y, dtype=np.int32)
+
+    feat_names = ['ZCR', 'mean_AC', 'Spec_Centroid(Hz)', 'Spec_Rolloff(Hz)',
+                  'Spec_Entropy', 'Spec_Flatness']
+    print(f"\n  Feature summary — shape={X.shape}")
+    print(f"  {'Feature':20s}  {'Clean mean':>12} {'Clean std':>10}  "
+          f"{'Reverb mean':>12} {'Reverb std':>10}")
+    print(f"  {'-'*70}")
+    for i, fn in enumerate(feat_names):
+        print(f"  {fn:20s}  "
+              f"{np.mean(X[y==0, i]):>12.5f} {np.std(X[y==0, i]):>10.5f}  "
+              f"{np.mean(X[y==1, i]):>12.5f} {np.std(X[y==1, i]):>10.5f}")
+    return X, y
+
+
+print(f"{'='*70}")
+print(f"  STEP 4: Computing 6-dim feature vector")
+print(f"  [ZCR | mean_AC(lags 1..{N_AC_LAGS}) | Spec Centroid | "
+      f"Spec Rolloff({int(ROLLOFF_PERCENT*100)}%) | Spec Entropy | Spec Flatness]")
+print(f"  ALL features on 1-bit QUANTIZED signal")
+print(f"{'='*70}")
+
+X_train_raw, y_train_raw = process_feature_split(TRAIN_NPY_DIR, 'train')
+X_val,       y_val       = process_feature_split(VAL_NPY_DIR,   'val')
+X_test,      y_test      = process_feature_split(TEST_NPY_DIR,  'test')
+
+rng_tr  = np.random.default_rng(seed=SEED)
+idx     = rng_tr.permutation(len(y_train_raw))
+X_train = X_train_raw[idx]
+y_train = y_train_raw[idx]
+
+print(f"\n  ✅ Train shuffled — "
+      f"clean(0)={np.sum(y_train==0)}  reverb(1)={np.sum(y_train==1)}")
+
+for name, arr in [('X_train', X_train), ('X_val', X_val), ('X_test', X_test)]:
+    nc, ic = np.isnan(arr).sum(), np.isinf(arr).sum()
+    status = '✅ clean' if nc == 0 and ic == 0 else '❌ PROBLEM'
+    print(f"  {name}: NaN={nc}  Inf={ic}  {status}")
+
+np.save(os.path.join(FEAT_DIR, 'feat_train_X.npy'), X_train)
+np.save(os.path.join(FEAT_DIR, 'feat_train_y.npy'), y_train)
+np.save(os.path.join(FEAT_DIR, 'feat_val_X.npy'),   X_val)
+np.save(os.path.join(FEAT_DIR, 'feat_val_y.npy'),   y_val)
+np.save(os.path.join(FEAT_DIR, 'feat_test_X.npy'),  X_test)
+np.save(os.path.join(FEAT_DIR, 'feat_test_y.npy'),  y_test)
+
+print(f"\n  Feature arrays saved → {FEAT_DIR}")
+for fname in sorted(os.listdir(FEAT_DIR)):
+    if fname.endswith('.npy'):
+        arr = np.load(os.path.join(FEAT_DIR, fname))
+        print(f"  {fname:28s} shape={arr.shape}  dtype={arr.dtype}")
+
+feat_names = ['ZCR', 'mean_AC', 'Spec_Centroid(Hz)', 'Spec_Rolloff(Hz)',
+              'Spec_Entropy', 'Spec_Flatness']
+print(f"\n  DIAGNOSTIC — First training sample")
+print(f"  label={y_train[0]} → {'Clean' if y_train[0]==0 else 'Reverb'}")
+print(f"  {'Feature':20s}  {'Value':>12}")
+print(f"  {'-'*36}")
+for fn, val in zip(feat_names, X_train[0]):
+    print(f"  {fn:20s}  {val:>12.6f}")
+
+print(f"\n✅ Step 4 done!")
+# ════════════════════════════════════════════════════════════════════════════
+# CELL 5B — MULTI-CLASSIFIER COMPARISON
+#
+#   Models : SVM | Random Forest | Logistic Regression | KNN |
+#             Gradient Boosting | Naive Bayes
+#
+#   Feature vector : [ZCR | mean_AC | Spec_Centroid | Spec_Rolloff |
+#                     Spec_Entropy | Spec_Flatness]
+#   Quantization   : Scheme 1 (1-bit sign)
+#   Scaler fit on TRAIN only — no data leakage.
+# ════════════════════════════════════════════════════════════════════════════
+
+from sklearn.svm              import SVC
+from sklearn.ensemble         import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model     import LogisticRegression
+from sklearn.neighbors        import KNeighborsClassifier
+from sklearn.naive_bayes      import GaussianNB
+from sklearn.preprocessing    import StandardScaler
+from sklearn.metrics          import (accuracy_score, precision_score,
+                                      recall_score, f1_score,
+                                      classification_report,
+                                      confusion_matrix, ConfusionMatrixDisplay)
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from IPython.display import Image
+%matplotlib inline
+
+# ── Load features ─────────────────────────────────────────────────────────────
+X_train = np.load(os.path.join(FEAT_DIR, 'feat_train_X.npy'))
+y_train = np.load(os.path.join(FEAT_DIR, 'feat_train_y.npy'))
+X_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_X.npy'))
+y_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_y.npy'))
+X_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_X.npy'))
+y_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_y.npy'))
+
+print(f"✅ Features loaded — dim={X_train.shape[1]} (expected {N_FEATURES})")
+print(f"   Train={X_train.shape}  Val={X_val.shape}  Test={X_test.shape}")
+
+# ── Scale (fit on TRAIN only — no leakage) ────────────────────────────────────
+scaler     = StandardScaler()
+X_train_sc = scaler.fit_transform(X_train)
+X_val_sc   = scaler.transform(X_val)
+X_test_sc  = scaler.transform(X_test)
+
+print(f"✅ Scaler fit on train only")
+print(f"   mean  = {scaler.mean_.round(5)}")
+print(f"   scale = {scaler.scale_.round(5)}")
+
+classifiers = {
+    'SVM':            SVC(kernel='rbf', C=1.0, gamma='scale',
+                          random_state=SEED),
+
+    'Random Forest':  RandomForestClassifier(
+                          n_estimators=200,
+                          max_depth=4,          # ← was 6
+                          min_samples_leaf=10,  # ← was 5
+                          min_samples_split=10, # ← new
+                          max_features='sqrt',
+                          random_state=SEED,
+                          n_jobs=-1),
+
+    'Logistic Reg.':  LogisticRegression(max_iter=1000,
+                                         solver='lbfgs',
+                                         multi_class='auto',
+                                         random_state=SEED),
+
+    'KNN':            KNeighborsClassifier(
+                          n_neighbors=15,       # ← was 7 (larger = smoother boundary)
+                          metric='minkowski',
+                          n_jobs=-1),
+
+    'Gradient Boost': GradientBoostingClassifier(
+                          n_estimators=80,      # ← was 100
+                          learning_rate=0.03,   # ← was 0.05
+                          max_depth=2,          # ← was 3
+                          min_samples_leaf=10,  # ← was 5
+                          subsample=0.8,        # ← new: row subsampling
+                          random_state=SEED),
+
+    'Naive Bayes':    GaussianNB(),
+}
+
+eval_splits = [
+    ('TRAIN', X_train_sc, y_train),
+    ('VAL',   X_val_sc,   y_val),
+    ('TEST',  X_test_sc,  y_test),
+]
+
+FEAT_LABEL = '[ZCR | mean_AC | Spec_Centroid | Spec_Rolloff | Spec_Entropy | Spec_Flatness]'
+SAVE_TAG   = '6dim'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  TRAIN & EVALUATE ALL MODELS
+# ══════════════════════════════════════════════════════════════════════════════
+master_results = {}
+
+for clf_name, clf in classifiers.items():
+    print(f"\n{'═'*65}")
+    print(f"  CLASSIFIER : {clf_name}")
+    print(f"{'═'*65}")
+
+    clf.fit(X_train_sc, y_train)
+    master_results[clf_name] = {}
+
+    for split_name, X_sc, y_true in eval_splits:
+        y_pred = clf.predict(X_sc)
+
+        acc  = accuracy_score (y_true, y_pred)
+        prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        rec  = recall_score   (y_true, y_pred, average='macro', zero_division=0)
+        f1   = f1_score       (y_true, y_pred, average='macro', zero_division=0)
+        cm   = confusion_matrix(y_true, y_pred)
+        rep  = classification_report(y_true, y_pred,
+                                     target_names=['Clean(0)', 'Reverb(1)'],
+                                     zero_division=0)
+
+        master_results[clf_name][split_name] = dict(
+            acc=acc, prec=prec, rec=rec, f1=f1,
+            cm=cm, report=rep, y_pred=y_pred, y_true=y_true)
+
+        print(f"\n  ── {split_name}")
+        print(f"     Accuracy  : {acc*100:6.2f}%")
+        print(f"     Precision : {prec*100:6.2f}%  (macro)")
+        print(f"     Recall    : {rec*100:6.2f}%  (macro)")
+        print(f"     F1        : {f1*100:6.2f}%  (macro)")
+        print(rep)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOT 1 — Confusion Matrices  (6 models × 3 splits)
+# ══════════════════════════════════════════════════════════════════════════════
+split_colors = {'TRAIN': 'steelblue', 'VAL': 'seagreen', 'TEST': 'tomato'}
+clf_names    = list(classifiers.keys())
+n_models     = len(clf_names)
+
+fig, axes = plt.subplots(n_models, 3, figsize=(13, 3.5 * n_models))
+fig.suptitle(
+    f'Confusion Matrices — All Classifiers\n'
+    f'{FEAT_LABEL}  ({N_FEATURES} dims)\n'
+    f'Scheme 1 (1-bit)  |  Train={N_TRAIN}  Val={N_VAL}  Test={N_TEST}',
+    fontsize=13, fontweight='bold', y=1.01)
+
+for row, clf_name in enumerate(clf_names):
+    for col, (split_name, _, _) in enumerate(eval_splits):
+        ax  = axes[row][col]
+        res = master_results[clf_name][split_name]
+        ConfusionMatrixDisplay(res['cm'],
+                               display_labels=['Clean', 'Reverb']).plot(
+            ax=ax, colorbar=False, cmap='Blues')
+        ax.set_title(
+            f"{clf_name} — {split_name}\n"
+            f"Acc={res['acc']*100:.1f}%  "
+            f"F1={res['f1']*100:.1f}%",
+            fontweight='bold',
+            color=split_colors[split_name],
+            fontsize=8)
+
+plt.tight_layout()
+plt.savefig(f'/content/cm_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/cm_all_models_{SAVE_TAG}.png')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOT 2 — Side-by-Side Metric Bars  (one chart per split)
+# ══════════════════════════════════════════════════════════════════════════════
+metric_colors  = ['steelblue', 'seagreen', 'goldenrod', 'tomato']
+metric_keys    = ['acc', 'prec', 'rec', 'f1']
+metric_labels  = ['Accuracy', 'Precision', 'Recall', 'F1 (macro)']
+
+x     = np.arange(n_models)
+width = 0.18
+
+fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
+fig2.suptitle(
+    f'All Classifiers — Accuracy / Precision / Recall / F1  (macro)\n'
+    f'{FEAT_LABEL}  ({N_FEATURES} dims)  '
+    f'Train={N_TRAIN}  Val={N_VAL}  Test={N_TEST}',
+    fontsize=12, fontweight='bold')
+
+for col, (split_name, _, _) in enumerate(eval_splits):
+    ax = axes2[col]
+    for i, (mkey, mlabel, mcolor) in enumerate(
+            zip(metric_keys, metric_labels, metric_colors)):
+        vals   = [master_results[cn][split_name][mkey] * 100 for cn in clf_names]
+        offset = (i - 1.5) * width
+        bars   = ax.bar(x + offset, vals, width,
+                        label=mlabel, color=mcolor,
+                        edgecolor='white', linewidth=0.6)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.6,
+                    f'{val:.1f}', ha='center', va='bottom',
+                    fontsize=5.5, fontweight='bold', rotation=90)
+
+    ax.set_ylim(0, 125)
+    ax.set_xticks(x)
+    ax.set_xticklabels(clf_names, fontsize=8, rotation=15, ha='right')
+    ax.set_ylabel('Score (%)' if col == 0 else '')
+    ax.set_title(split_name, fontweight='bold',
+                 color=split_colors[split_name], fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    if col == 0:
+        ax.legend(fontsize=8, loc='upper right')
+
+plt.tight_layout()
+plt.savefig(f'/content/metrics_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/metrics_all_models_{SAVE_TAG}.png')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOT 3 — TEST F1 Ranking  (horizontal bar, best → worst)
+# ══════════════════════════════════════════════════════════════════════════════
+test_f1s     = [(cn, master_results[cn]['TEST']['f1'] * 100) for cn in clf_names]
+test_f1s     = sorted(test_f1s, key=lambda x: x[1], reverse=True)
+sorted_names, sorted_f1s = zip(*test_f1s)
+
+bar_colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(sorted_names)))
+
+fig3, ax3 = plt.subplots(figsize=(9, 4))
+bars = ax3.barh(sorted_names, sorted_f1s, color=bar_colors, edgecolor='white')
+ax3.set_xlim(0, 115)
+ax3.set_xlabel('Test F1 — macro (%)', fontsize=10)
+ax3.set_title(
+    f'TEST F1 Ranking — All Classifiers\n'
+    f'{FEAT_LABEL}  ({N_FEATURES} dims)',
+    fontweight='bold')
+ax3.grid(axis='x', alpha=0.3)
+ax3.invert_yaxis()
+
+for bar, val in zip(bars, sorted_f1s):
+    ax3.text(val + 0.8, bar.get_y() + bar.get_height() / 2,
+             f'{val:.2f}%', va='center', fontsize=9, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig(f'/content/test_f1_ranking_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_f1_ranking_{SAVE_TAG}.png')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOT 4 — TEST Line Chart  (Acc / Prec / Recall / F1 across models)
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOT 4 — TEST Accuracy Ranking  (horizontal bar, best → worst)
+# ══════════════════════════════════════════════════════════════════════════════
+test_accs     = [(cn, master_results[cn]['TEST']['acc'] * 100) for cn in clf_names]
+test_accs     = sorted(test_accs, key=lambda x: x[1], reverse=True)
+sorted_names_acc, sorted_accs = zip(*test_accs)
+
+bar_colors = plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(sorted_names_acc)))
+
+fig4, ax4 = plt.subplots(figsize=(12, 5))
+
+x_line = np.arange(n_models)
+acc_vals = [master_results[cn]['TEST']['acc'] * 100 for cn in clf_names]
+
+bars = ax4.bar(x_line, acc_vals, color=bar_colors, edgecolor='white', width=0.5)
+
+for bar, val in zip(bars, acc_vals):
+    ax4.text(bar.get_x() + bar.get_width() / 2,
+             bar.get_height() + 0.5,
+             f'{val:.2f}%', ha='center', va='bottom',
+             fontsize=9, fontweight='bold')
+
+# shade best-accuracy model
+best_idx = np.argmax(acc_vals)
+ax4.get_children()[best_idx].set_edgecolor('gold')
+ax4.get_children()[best_idx].set_linewidth(2.5)
+ax4.text(best_idx, max(acc_vals) + 3,
+         f'★ Best\n{clf_names[best_idx]}',
+         ha='center', fontsize=8, color='goldenrod', fontweight='bold')
+
+ax4.set_xticks(x_line)
+ax4.set_xticklabels(clf_names, fontsize=10, rotation=12, ha='right')
+ax4.set_ylim(0, 115)
+ax4.set_ylabel('Accuracy (%)', fontsize=11)
+ax4.set_title(
+    f'TEST Set — Accuracy (all classifiers)\n'
+    f'{FEAT_LABEL}  ({N_FEATURES} dims)  '
+    f'Train={N_TRAIN}  Val={N_VAL}  Test={N_TEST}',
+    fontsize=12, fontweight='bold')
+ax4.grid(axis='y', alpha=0.3, linestyle='--')
+
+plt.tight_layout()
+plt.savefig(f'/content/test_accuracy_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_accuracy_{SAVE_TAG}.png')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+split_names = ['TRAIN', 'VAL', 'TEST']
+col_w = 9
+
+print(f"\n{'═'*100}")
+print(f"  FINAL COMPARISON TABLE — All Classifiers")
+print(f"  Feature : {FEAT_LABEL}  →  {N_FEATURES} dims")
+print(f"  Quantization : Scheme 1 (1-bit sign)  |  "
+      f"Train={N_TRAIN}  Val={N_VAL}  Test={N_TEST}")
+print(f"{'═'*100}")
+
+header = f"  {'Model':<20}"
+for s in split_names:
+    header += f"  {s+' Acc':>{col_w}} {s+' F1':>{col_w}}"
+print(header)
+print(f"  {'-'*92}")
+
+for cn in clf_names:
+    row = f"  {cn:<20}"
+    for s in split_names:
+        r = master_results[cn][s]
+        row += f"  {r['acc']*100:>{col_w-1}.2f}%  {r['f1']*100:>{col_w-1}.2f}%"
+    print(row)
+
+print(f"\n{'─'*100}")
+print(f"  OVERFIT CHECK  (Train Acc − Val Acc)")
+print(f"  {'Model':<20}  {'Gap':>8}   {'Status'}")
+print(f"  {'─'*60}")
+for cn in clf_names:
+    gap  = master_results[cn]['TRAIN']['acc'] - master_results[cn]['VAL']['acc']
+    flag = ('✅ No overfit'      if abs(gap) < 0.05 else
+            '⚠️  Slight overfit' if abs(gap) < 0.10 else
+            '❌ Overfit')
+    print(f"  {cn:<20}  {gap*100:>+7.2f}%   {flag}")
+
+print(f"\n{'─'*100}")
+print(f"  BEST TEST F1  →  {sorted_names[0]}  ({sorted_f1s[0]:.2f}%)")
+print(f"{'═'*100}")
+print(f"\n✅ All done!")
+# ════════════════════════════════════════════════════════
+# CELL 0  Libraries and import of drive
+# ════════════════════════════════════════════════════════
+!pip install pyroomacoustics soundfile librosa -q
+
+import os, glob, shutil, hashlib
+import numpy as np
+import librosa
+import pyroomacoustics as pra
+from collections import defaultdict
+from google.colab import drive
+drive.mount('/content/drive')
+print("✅ Imports done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 1 — STEP 1: EXPLORE DATASET
+# ════════════════════════════════════════════════════════
+SPLIT_BASE   = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_WAV_SPLIT'
+TRAIN_WAV_DIR = os.path.join(SPLIT_BASE, 'train')
+VAL_WAV_DIR   = os.path.join(SPLIT_BASE, 'val')
+TEST_WAV_DIR  = os.path.join(SPLIT_BASE, 'test')
+
+train_files = sorted(glob.glob(os.path.join(TRAIN_WAV_DIR, '**', '*.wav'), recursive=True))
+val_files   = sorted(glob.glob(os.path.join(VAL_WAV_DIR,   '**', '*.wav'), recursive=True))
+test_files  = sorted(glob.glob(os.path.join(TEST_WAV_DIR,  '**', '*.wav'), recursive=True))
+
+def summarise_split(file_list, split_name):
+    speakers = set()
+    dr_info  = defaultdict(lambda: {'F': 0, 'M': 0, 'files': 0, 'speakers': set()})
+    for path in file_list:
+        parts  = path.split('/')
+        dr, spk = parts[-3], parts[-2]
+        gender = 'F' if spk.startswith('F') else 'M'
+        speakers.add(spk)
+        dr_info[dr]['files'] += 1
+        dr_info[dr][gender]  += 1
+        dr_info[dr]['speakers'].add(spk)
+    return speakers, dr_info
+
+print(f"{'='*65}")
+print(f"  DATASET OVERVIEW — SAMPLE_WAV_SPLIT")
+print(f"{'='*65}")
+print(f"  {'Split':8s} {'Files':>8} {'Speakers':>10} {'Female':>8} {'Male':>8}")
+print(f"  {'-'*46}")
+for split_name, file_list in [('Train', train_files), ('Valid', val_files), ('Test', test_files)]:
+    spks, _ = summarise_split(file_list, split_name)
+    f = sum(1 for p in file_list if p.split('/')[-2].startswith('F'))
+    m = len(file_list) - f
+    print(f"  {split_name:8s} {len(file_list):>8} {len(spks):>10} {f:>8} {m:>8}")
+print(f"\n✅ Step 1 done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 2 — STEP 2: CHOOSE FILE COUNTS
+# ════════════════════════════════════════════════════════
+N_TRAIN = 500
+N_VAL   = 100
+N_TEST  = 100
+SEED    = 42
+
+assert N_TRAIN <= len(train_files)
+assert N_VAL   <= len(val_files)
+assert N_TEST  <= len(test_files)
+
+import random
+rng = random.Random(SEED)
+tr = train_files.copy(); rng.shuffle(tr); train_chosen = tr[:N_TRAIN]
+vl = val_files.copy();   rng.shuffle(vl); val_chosen   = vl[:N_VAL]
+te = test_files.copy();  rng.shuffle(te); test_chosen  = te[:N_TEST]
+
+print(f"  {'Split':8s} {'Chosen':>8}")
+for name, chosen in [('Train', train_chosen), ('Valid', val_chosen), ('Test', test_chosen)]:
+    print(f"  {name:8s} {len(chosen):>8}")
+print(f"\n✅ Step 2 done — {N_TRAIN}/{N_VAL}/{N_TEST} files selected!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3A — WRITE speech_quantization.py
+# ════════════════════════════════════════════════════════
+quant_code = '''
+import numpy as np
+
+MU = 255
+A  = 87.6
+
+def normalise(x):
+    x    = np.asarray(x, dtype=np.float64)
+    peak = np.max(np.abs(x))
+    return x if peak == 0.0 else x / peak
+
+def mu_law_compress(x, mu=MU):
+    x = np.clip(x, -1.0, 1.0)
+    return np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+
+def a_law_compress(x, a=A):
+    x   = np.clip(x, -1.0, 1.0)
+    ax  = np.abs(x)
+    lna = np.log(a)
+    out = np.where(ax <= 1.0/a,
+                   a * ax / (1.0 + lna),
+                   (1.0 + np.log(a * ax + 1e-12)) / (1.0 + lna))
+    return np.sign(x) * np.clip(out, 0.0, 1.0)
+
+def _uniform_midtread(x, bit_depth):
+    delta = 2.0 ** (1 - bit_depth)
+    x_q   = delta * np.round(x / delta)
+    return np.clip(x_q, -(1.0 - delta/2.0), 1.0 - delta/2.0)
+
+def _log2_quantize(x, bit_depth):
+    x     = np.clip(x, -1.0, 1.0)
+    sign  = np.sign(x)
+    mag   = np.abs(x)
+    eps   = 2.0 ** -(2 ** (bit_depth - 1))
+    log_mag  = np.log2(np.where(mag < eps, eps, mag))
+    log_min  = -float(2 ** (bit_depth - 1))
+    log_norm = np.clip(log_mag / (-log_min), 0.0, 1.0)
+    levels   = 2 ** (bit_depth - 1)
+    log_q    = np.round(log_norm * (levels - 1)) / (levels - 1)
+    mag_q    = 2.0 ** (log_q * log_min)
+    return np.where(sign == 0, 0.0, sign * mag_q)
+
+def quantize(x, scheme, bit_depth=1, mu=MU, a=A):
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, -1.0, 1.0)
+    if scheme == 1: return np.where(x > 0, 1.0, -1.0)
+    if scheme == 6: return x.copy()
+    if scheme == 2: return _uniform_midtread(x, bit_depth)
+    if scheme == 3: return _uniform_midtread(mu_law_compress(x, mu), bit_depth)
+    if scheme == 4: return _uniform_midtread(a_law_compress(x, a), bit_depth)
+    if scheme == 5: return _log2_quantize(x, bit_depth)
+    raise ValueError(f"Unknown scheme: {scheme}")
+'''
+with open('/content/speech_quantization.py', 'w') as f:
+    f.write(quant_code)
+
+from speech_quantization import quantize, normalise
+print("✅ speech_quantization.py written and imported!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3B — DEREVERBERATION HELPER
+# ════════════════════════════════════════════════════════
+SR          = 16000
+MASTER_SEED = 42
+
+derev_params = {
+    "t60_range"          : [0.1, 2.5],
+    "dim_range"          : [5, 15, 5, 15, 2, 6],
+    "min_distance_to_wall": 1.0
+}
+
+def apply_dereverberation(speech, seed):
+    np.random.seed(seed)
+
+    t60 = np.random.uniform(*derev_params["t60_range"])
+    room_dim = np.array([
+        np.random.uniform(derev_params["dim_range"][2*n],
+                          derev_params["dim_range"][2*n+1])
+        for n in range(3)
+    ])
+    center_mic = np.array([
+        np.random.uniform(derev_params["min_distance_to_wall"],
+                          room_dim[n] - derev_params["min_distance_to_wall"])
+        for n in range(3)
+    ])
+
+    for _ in range(100):
+        source_pos = np.array([
+            np.random.uniform(derev_params["min_distance_to_wall"],
+                              room_dim[n] - derev_params["min_distance_to_wall"])
+            for n in range(3)
+        ])
+        if np.linalg.norm(source_pos - center_mic) >= 0.5:
+            break
+
+    n_mics  = np.random.randint(1, 5)
+    radius  = np.random.uniform(0.05, 0.5)
+    mic_array_2d = pra.beamforming.circular_2D_array(
+        center_mic[:-1], n_mics, phi0=0, radius=radius)
+    mic_array = np.pad(mic_array_2d, ((0,1),(0,0)),
+                       mode='constant', constant_values=center_mic[-1])
+
+    e_abs, max_order = pra.inverse_sabine(t60, room_dim)
+    use_ray = np.random.rand() > 0.5
+
+    rev_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(e_abs),
+                           max_order=min(3, max_order),
+                           ray_tracing=use_ray)
+    if use_ray:
+        rev_room.set_ray_tracing()
+    rev_room.add_microphone_array(mic_array)
+    rev_room.add_source(source_pos, signal=speech)
+    rev_room.compute_rir(); rev_room.simulate()
+
+    t60_real     = np.mean(rev_room.measure_rt60()).squeeze()
+    lossy_speech = np.squeeze(np.array(rev_room.mic_array.signals))
+    if lossy_speech.ndim > 1:
+        lossy_speech = lossy_speech[0]
+
+    dry_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(0.99),
+                           max_order=0)
+    dry_room.add_microphone_array(mic_array)
+    dry_room.add_source(source_pos, signal=speech)
+    dry_room.compute_rir(); dry_room.simulate()
+
+    speech_out = np.squeeze(np.array(dry_room.mic_array.signals))
+    if speech_out.ndim > 1:
+        speech_out = speech_out[0]
+
+    # Internal low-level noise (very high SNR, not the additive noise stage)
+    snr_db      = np.random.uniform(30, 60)
+    noise_power = (1/speech_out.shape[0]) * np.sum(speech_out**2) \
+                  * np.power(10, -snr_db/10)
+    noise_dur   = np.random.uniform(0.2, 1.0)
+    noise_sig   = np.random.randn(int(noise_dur * SR)) * np.sqrt(noise_power)
+    speech_out  = np.concatenate([speech_out, noise_sig])
+
+    min_len = min(lossy_speech.shape[0], speech_out.shape[0])
+    return speech_out[:min_len], lossy_speech[:min_len], t60_real
+
+print("✅ Dereverberation helper ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3C — NOISE INJECTION HELPERS
+# ════════════════════════════════════════════════════════
+
+# ── Directory containing NoiseX-92 .wav files ───────────────────────────────
+NOISE_DIR  = '/content/drive/MyDrive/DATASET_IISC/NoiseX'
+
+# SNR range (dB) sampled uniformly per utterance
+SNR_MIN, SNR_MAX = 0.0, 20.0     # adjust to taste
+
+def _get_noise_files(noise_dir):
+    """Return sorted list of all .wav files in noise_dir."""
+    files = sorted([
+        os.path.join(noise_dir, f)
+        for f in os.listdir(noise_dir)
+        if f.lower().endswith('.wav')
+    ])
+    assert len(files) > 0, f"❌ No .wav files found in {noise_dir}"
+    return files
+
+# Pre-load the file list once
+_NOISE_FILES = _get_noise_files(NOISE_DIR)
+print(f"✅ Found {len(_NOISE_FILES)} noise file(s) in {NOISE_DIR}:")
+for f in _NOISE_FILES:
+    print(f"   {os.path.basename(f)}")
+
+
+def _match_length(noise, length):
+    """
+    Trim or tile `noise` so its length equals `length`.
+    """
+    n = len(noise)
+    if n >= length:
+        start = np.random.randint(0, n - length + 1)
+        return noise[start : start + length]
+    repeats = int(np.ceil(length / n))
+    return np.tile(noise, repeats)[:length]
+
+
+def add_noise(clean_raw, reverb_raw, rng_seed):
+    """
+    Randomly pick one NoiseX file, scale it to a random SNR,
+    and add the SAME noise realisation to both clean and reverb signals.
+
+    Parameters
+    ----------
+    clean_raw  : 1-D float64 array  — dry (room-simulated clean) speech
+    reverb_raw : 1-D float64 array  — reverberant speech (same length)
+    rng_seed   : int                — reproducible seed for this utterance
+
+    Returns
+    -------
+    clean_noisy  : noisy clean signal
+    reverb_noisy : noisy reverberant signal
+    chosen_noise : basename of the selected noise file
+    snr_db       : SNR actually applied (dB)
+    """
+    np.random.seed(rng_seed)
+
+    # Step 1 — randomly choose one noise file
+    noise_path   = _NOISE_FILES[np.random.randint(len(_NOISE_FILES))]
+    noise_signal, _ = librosa.load(noise_path, sr=SR, mono=True)
+    noise_signal = noise_signal.astype(np.float64)
+
+    # Step 2 — match noise length to speech length
+    length       = len(clean_raw)
+    noise_matched = _match_length(noise_signal, length)
+
+    # Step 3 — randomly choose SNR
+    snr_db = np.random.uniform(SNR_MIN, SNR_MAX)
+
+    # Step 4 — compute powers (SNR anchored to clean speech)
+    speech_power = np.mean(clean_raw ** 2)
+    noise_power  = np.mean(noise_matched ** 2)
+
+    if noise_power < 1e-12 or speech_power < 1e-12:
+        # silent signal / silent noise — return as-is
+        return clean_raw.copy(), reverb_raw.copy(), os.path.basename(noise_path), snr_db
+
+    # Step 5 — scale noise to desired SNR
+    desired_noise_power = speech_power / (10 ** (snr_db / 10))
+    scale_factor        = np.sqrt(desired_noise_power / (noise_power + 1e-10))
+    scaled_noise        = noise_matched * scale_factor
+
+    # Step 6 — add SAME scaled noise to both signals
+    clean_noisy  = clean_raw  + scaled_noise
+    reverb_noisy = reverb_raw + scaled_noise
+
+    return clean_noisy, reverb_noisy, os.path.basename(noise_path), snr_db
+
+print("✅ Noise injection helpers ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3D — STEP 3: APPLY REVERBERATION + NOISE + QUANTIZATION
+#
+# Processing chain per utterance:
+#   speech.wav
+#     └─ apply_dereverberation()
+#           ├─ clean_raw   (dry)
+#           └─ reverb_raw  (reverberant)
+#                 └─ add_noise()   ← NEW
+#                       ├─ clean_noisy
+#                       └─ reverb_noisy
+#                             └─ normalise()
+#                                   └─ quantize(scheme=1, 1-bit)
+#                                         ├─ clean_q   → *_clean_q.npy
+#                                         └─ reverb_q  → *_reverb_q.npy
+# ════════════════════════════════════════════════════════
+SAVE_BASE     = '/content/drive/MyDrive/DATASET_IISC/processed'
+TRAIN_NPY_DIR = os.path.join(SAVE_BASE, 'train')
+VAL_NPY_DIR   = os.path.join(SAVE_BASE, 'val')
+TEST_NPY_DIR  = os.path.join(SAVE_BASE, 'test')
+
+for d in [TRAIN_NPY_DIR, VAL_NPY_DIR, TEST_NPY_DIR]:
+    if os.path.exists(d): shutil.rmtree(d)
+    os.makedirs(d)
+    print(f"✅ Created: {d}")
+
+splits      = [('train', train_chosen, TRAIN_NPY_DIR),
+               ('val',   val_chosen,   VAL_NPY_DIR),
+               ('test',  test_chosen,  TEST_NPY_DIR)]
+total_files = N_TRAIN + N_VAL + N_TEST
+global_idx  = 0
+
+for split_name, file_list, out_dir in splits:
+    print(f"\n{'='*70}")
+    print(f"  {split_name.upper()} — {len(file_list)} files")
+    print(f"{'='*70}")
+
+    for wav_path in file_list:
+        global_idx += 1
+
+        # Reproducible per-utterance seed (path-based)
+        seed = int(
+            hashlib.md5(f"{MASTER_SEED}_{wav_path}".encode()).hexdigest(), 16
+        ) % (2**31)
+
+        dr  = wav_path.split('/')[-3]
+        spk = wav_path.split('/')[-2]
+        utt = os.path.splitext(os.path.basename(wav_path))[0]
+
+        print(f"  [{global_idx:04d}/{total_files}] {spk}/{utt}  seed={seed}", end=' ')
+
+        # ── Load speech ────────────────────────────────────────────────────
+        speech = librosa.load(wav_path, sr=SR, mono=True)[0].astype(np.float64)
+
+        # ── Stage 1: Room simulation ───────────────────────────────────────
+        try:
+            clean_raw, reverb_raw, t60 = apply_dereverberation(speech, seed)
+        except Exception as e:
+            print(f"⚠️  SKIPPED (dereverberation failed: {e})")
+            continue
+
+        # ── Stage 2: Noise injection (same noise → clean & reverb) ────────
+        # Use a derived seed so noise randomness is independent of room seed
+        noise_seed = (seed + 1) % (2**31)
+        try:
+            clean_noisy, reverb_noisy, noise_name, snr_db = add_noise(
+                clean_raw, reverb_raw, noise_seed
+            )
+        except Exception as e:
+            print(f"⚠️  SKIPPED (noise injection failed: {e})")
+            continue
+
+        # ── Stage 3: Normalise ─────────────────────────────────────────────
+        clean_norm  = normalise(clean_noisy)
+        reverb_norm = normalise(reverb_noisy)
+
+        # ── Stage 4: 1-bit sign quantization ──────────────────────────────
+        clean_q  = quantize(clean_norm,  scheme=1, bit_depth=1)
+        reverb_q = quantize(reverb_norm, scheme=1, bit_depth=1)
+
+        # ── Save ───────────────────────────────────────────────────────────
+        tag = f"{dr}_{spk}_{utt}_t60={t60:.2f}_snr={snr_db:.1f}dB"
+        np.save(os.path.join(out_dir, f"{tag}_clean_q.npy"),  clean_q)
+        np.save(os.path.join(out_dir, f"{tag}_reverb_q.npy"), reverb_q)
+
+        print(f"T60={t60:.3f}s  SNR={snr_db:.1f}dB  "
+              f"noise={noise_name}  len={len(clean_q)}")
+
+print(f"\n✅ Step 3 done — .npy files saved to {SAVE_BASE}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4A — CLEAR FEATURE FOLDER
+# ════════════════════════════════════════════════════════
+FEAT_DIR = '/content/drive/MyDrive/DATASET_IISC/features_zcr_meanac_sc_sro_se_sf_6dim'
+if os.path.exists(FEAT_DIR): shutil.rmtree(FEAT_DIR)
+os.makedirs(FEAT_DIR, exist_ok=True)
+print(f"✅ Fresh feature folder: {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4B — STEP 4: COMPUTE 6-DIM FEATURE VECTOR
+# ════════════════════════════════════════════════════════
+N_AC_LAGS        = 3
+N_FEATURES       = 6
+ROLLOFF_PERCENT  = 0.85
+LOG_EPS          = 1e-12
+
+def compute_zcr(signal):
+    signs = np.sign(signal); signs[signs == 0] = 1
+    return float(np.sum(np.diff(signs) != 0) / (len(signal) - 1))
+
+def compute_mean_autocorr(signal, n_lags=N_AC_LAGS):
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    if energy == 0.0: return 0.0
+    ac = np.array([np.sum(signal[:-k] * signal[k:]) / energy
+                   for k in range(1, n_lags + 1)])
+    return float(np.mean(ac))
+
+def compute_spectral_centroid(signal, sr):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    return float(np.sum(freqs * mag) / total)
+
+def compute_spectral_rolloff(signal, sr, roll_percent=ROLLOFF_PERCENT):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs   = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    cum_mag = np.cumsum(mag)
+    idx     = min(np.searchsorted(cum_mag, roll_percent * total), len(freqs) - 1)
+    return float(freqs[idx])
+
+def compute_spectral_entropy(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    total = np.sum(power)
+    if total == 0.0: return 0.0
+    P = power / total
+    return float(-np.sum(P * np.log2(P + LOG_EPS)) / np.log2(len(P)))
+
+def compute_spectral_flatness(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    if np.sum(power) == 0.0: return 0.0
+    return float(np.exp(np.mean(np.log(power + LOG_EPS))) /
+                 (np.mean(power) + LOG_EPS))
+
+def compute_features(signal_q, sr):
+    return np.array([
+        compute_zcr(signal_q),
+        compute_mean_autocorr(signal_q, N_AC_LAGS),
+        compute_spectral_centroid(signal_q, sr),
+        compute_spectral_rolloff(signal_q, sr, ROLLOFF_PERCENT),
+        compute_spectral_entropy(signal_q),
+        compute_spectral_flatness(signal_q),
+    ], dtype=np.float64)
+
+def process_feature_split(npy_dir, split_name):
+    all_files   = sorted(os.listdir(npy_dir))
+    clean_files = [f for f in all_files if f.endswith('_clean_q.npy')]
+    reverb_files= [f for f in all_files if f.endswith('_reverb_q.npy')]
+    assert len(clean_files) == len(reverb_files)
+
+    print(f"\n  {split_name.upper()} — {len(clean_files)} pairs")
+    X, y = [], []
+    for cf, rf in zip(clean_files, reverb_files):
+        cq = np.load(os.path.join(npy_dir, cf))
+        rq = np.load(os.path.join(npy_dir, rf))
+        fc = compute_features(cq, SR)
+        fr = compute_features(rq, SR)
+        X.extend([fc, fr]); y.extend([0, 1])
+        print(f"  {cf[:30]:30s}  "
+              f"ZCR={fc[0]:.4f}/{fr[0]:.4f}  "
+              f"mAC={fc[1]:.4f}/{fr[1]:.4f}  "
+              f"SC={fc[2]:.1f}/{fr[2]:.1f}Hz")
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+print(f"{'='*70}")
+print(f"  STEP 4: Computing 6-dim feature vector")
+print(f"  [ZCR | mean_AC(lags 1..{N_AC_LAGS}) | SC | SRO | SE | SF]")
+print(f"  ALL features on 1-bit QUANTIZED noisy signal")
+print(f"{'='*70}")
+
+X_train_raw, y_train_raw = process_feature_split(TRAIN_NPY_DIR, 'train')
+X_val,        y_val       = process_feature_split(VAL_NPY_DIR,   'val')
+X_test,       y_test      = process_feature_split(TEST_NPY_DIR,  'test')
+
+rng_tr = np.random.default_rng(seed=SEED)
+idx    = rng_tr.permutation(len(y_train_raw))
+X_train, y_train = X_train_raw[idx], y_train_raw[idx]
+
+for name, arr in [('X_train', X_train), ('X_val', X_val), ('X_test', X_test)]:
+    nc, ic = np.isnan(arr).sum(), np.isinf(arr).sum()
+    print(f"  {name}: NaN={nc} Inf={ic} {'✅' if nc==0 and ic==0 else '❌'}")
+
+np.save(os.path.join(FEAT_DIR, 'feat_train_X.npy'), X_train)
+np.save(os.path.join(FEAT_DIR, 'feat_train_y.npy'), y_train)
+np.save(os.path.join(FEAT_DIR, 'feat_val_X.npy'),   X_val)
+np.save(os.path.join(FEAT_DIR, 'feat_val_y.npy'),   y_val)
+np.save(os.path.join(FEAT_DIR, 'feat_test_X.npy'),  X_test)
+np.save(os.path.join(FEAT_DIR, 'feat_test_y.npy'),  y_test)
+print(f"\n✅ Step 4 done! Features saved → {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 5 — MULTI-CLASSIFIER COMPARISON
+# ════════════════════════════════════════════════════════
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from IPython.display import Image
+%matplotlib inline
+
+from sklearn.svm                 import SVC
+from sklearn.ensemble            import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model        import LogisticRegression
+from sklearn.neighbors           import KNeighborsClassifier
+from sklearn.naive_bayes         import GaussianNB
+from sklearn.preprocessing       import StandardScaler
+from sklearn.metrics             import (accuracy_score, precision_score, recall_score,
+                                         f1_score, classification_report,
+                                         confusion_matrix, ConfusionMatrixDisplay)
+
+X_train = np.load(os.path.join(FEAT_DIR, 'feat_train_X.npy'))
+y_train = np.load(os.path.join(FEAT_DIR, 'feat_train_y.npy'))
+X_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_X.npy'))
+y_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_y.npy'))
+X_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_X.npy'))
+y_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_y.npy'))
+
+scaler      = StandardScaler()
+X_train_sc  = scaler.fit_transform(X_train)
+X_val_sc    = scaler.transform(X_val)
+X_test_sc   = scaler.transform(X_test)
+
+classifiers = {
+    'SVM'           : SVC(kernel='rbf', C=1.0, gamma='scale', random_state=SEED),
+    'Random Forest' : RandomForestClassifier(n_estimators=200, max_depth=4,
+                          min_samples_leaf=10, min_samples_split=10,
+                          max_features='sqrt', random_state=SEED, n_jobs=-1),
+    'Logistic Reg.' : LogisticRegression(max_iter=1000, solver='lbfgs',
+                          multi_class='auto', random_state=SEED),
+    'KNN'           : KNeighborsClassifier(n_neighbors=15, metric='minkowski', n_jobs=-1),
+    'Gradient Boost': GradientBoostingClassifier(n_estimators=80, learning_rate=0.03,
+                          max_depth=2, min_samples_leaf=10, subsample=0.8,
+                          random_state=SEED),
+    'Naive Bayes'   : GaussianNB(),
+}
+
+eval_splits  = [('TRAIN', X_train_sc, y_train),
+                ('VAL',   X_val_sc,   y_val),
+                ('TEST',  X_test_sc,  y_test)]
+FEAT_LABEL   = '[ZCR | mean_AC | Spec_Centroid | Spec_Rolloff | Spec_Entropy | Spec_Flatness]'
+SAVE_TAG     = '6dim'
+split_colors = {'TRAIN': 'steelblue', 'VAL': 'seagreen', 'TEST': 'tomato'}
+clf_names    = list(classifiers.keys())
+n_models     = len(clf_names)
+
+master_results = {}
+for clf_name, clf in classifiers.items():
+    print(f"\n{'═'*65}\n  CLASSIFIER : {clf_name}\n{'═'*65}")
+    clf.fit(X_train_sc, y_train)
+    master_results[clf_name] = {}
+    for split_name, X_sc, y_true in eval_splits:
+        y_pred = clf.predict(X_sc)
+        master_results[clf_name][split_name] = dict(
+            acc  = accuracy_score(y_true, y_pred),
+            prec = precision_score(y_true, y_pred, average='macro', zero_division=0),
+            rec  = recall_score  (y_true, y_pred, average='macro', zero_division=0),
+            f1   = f1_score      (y_true, y_pred, average='macro', zero_division=0),
+            cm   = confusion_matrix(y_true, y_pred),
+            report = classification_report(y_true, y_pred,
+                         target_names=['Clean(0)', 'Reverb(1)'], zero_division=0),
+            y_pred=y_pred, y_true=y_true)
+        r = master_results[clf_name][split_name]
+        print(f"\n  ── {split_name}")
+        print(f"  Accuracy : {r['acc']*100:6.2f}%  F1 : {r['f1']*100:6.2f}%")
+        print(r['report'])
+
+# ── Plot 1 — Confusion matrices ──────────────────────────────────────────────
+fig, axes = plt.subplots(n_models, 3, figsize=(13, 3.5*n_models))
+fig.suptitle(f'Confusion Matrices — All Classifiers\n'
+             f'{FEAT_LABEL} ({N_FEATURES} dims)\n'
+             f'Scheme 1 (1-bit) | Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+             fontsize=13, fontweight='bold', y=1.01)
+for row, cn in enumerate(clf_names):
+    for col, (sn, _, _) in enumerate(eval_splits):
+        res = master_results[cn][sn]
+        ConfusionMatrixDisplay(res['cm'],
+            display_labels=['Clean','Reverb']).plot(
+            ax=axes[row][col], colorbar=False, cmap='Blues')
+        axes[row][col].set_title(
+            f"{cn} — {sn}\nAcc={res['acc']*100:.1f}% F1={res['f1']*100:.1f}%",
+            fontweight='bold', color=split_colors[sn], fontsize=8)
+plt.tight_layout()
+plt.savefig(f'/content/cm_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/cm_all_models_{SAVE_TAG}.png')
+
+# ── Plot 2 — Metric bars ─────────────────────────────────────────────────────
+metric_colors = ['steelblue','seagreen','goldenrod','tomato']
+metric_keys   = ['acc','prec','rec','f1']
+metric_labels = ['Accuracy','Precision','Recall','F1 (macro)']
+x = np.arange(n_models); width = 0.18
+
+fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
+fig2.suptitle(f'All Classifiers — Acc / Prec / Recall / F1\n'
+              f'{FEAT_LABEL} Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+for col, (sn, _, _) in enumerate(eval_splits):
+    ax = axes2[col]
+    for i, (mk, ml, mc) in enumerate(zip(metric_keys, metric_labels, metric_colors)):
+        vals  = [master_results[cn][sn][mk]*100 for cn in clf_names]
+        bars  = ax.bar(x+(i-1.5)*width, vals, width,
+                       label=ml, color=mc, edgecolor='white', linewidth=0.6)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.6,
+                    f'{val:.1f}', ha='center', va='bottom',
+                    fontsize=5.5, fontweight='bold', rotation=90)
+    ax.set_ylim(0, 125); ax.set_xticks(x)
+    ax.set_xticklabels(clf_names, fontsize=8, rotation=15, ha='right')
+    ax.set_title(sn, fontweight='bold', color=split_colors[sn], fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    if col == 0: ax.legend(fontsize=8, loc='upper right')
+plt.tight_layout()
+plt.savefig(f'/content/metrics_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/metrics_all_models_{SAVE_TAG}.png')
+
+# ── Plot 3 — TEST F1 ranking ──────────────────────────────────────────────────
+test_f1s      = sorted([(cn, master_results[cn]['TEST']['f1']*100) for cn in clf_names],
+                        key=lambda x: x[1], reverse=True)
+sorted_names, sorted_f1s = zip(*test_f1s)
+fig3, ax3 = plt.subplots(figsize=(9, 4))
+ax3.barh(sorted_names, sorted_f1s,
+         color=plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(sorted_names))),
+         edgecolor='white')
+ax3.set_xlim(0, 115); ax3.invert_yaxis()
+ax3.set_xlabel('Test F1 — macro (%)', fontsize=10)
+ax3.set_title(f'TEST F1 Ranking — All Classifiers\n{FEAT_LABEL}', fontweight='bold')
+ax3.grid(axis='x', alpha=0.3)
+for i, (bar, val) in enumerate(zip(ax3.patches, sorted_f1s)):
+    ax3.text(val+0.8, bar.get_y()+bar.get_height()/2,
+             f'{val:.2f}%', va='center', fontsize=9, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'/content/test_f1_ranking_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_f1_ranking_{SAVE_TAG}.png')
+
+# ── Plot 4 — TEST Accuracy bar ────────────────────────────────────────────────
+acc_vals = [master_results[cn]['TEST']['acc']*100 for cn in clf_names]
+bar_cols = plt.cm.RdYlGn(np.linspace(0.3, 0.9, n_models))
+fig4, ax4 = plt.subplots(figsize=(12, 5))
+bars = ax4.bar(np.arange(n_models), acc_vals, color=bar_cols, edgecolor='white', width=0.5)
+for bar, val in zip(bars, acc_vals):
+    ax4.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+             f'{val:.2f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+best_idx = int(np.argmax(acc_vals))
+bars[best_idx].set_edgecolor('gold'); bars[best_idx].set_linewidth(2.5)
+ax4.text(best_idx, max(acc_vals)+3, f'★ Best\n{clf_names[best_idx]}',
+         ha='center', fontsize=8, color='goldenrod', fontweight='bold')
+ax4.set_xticks(np.arange(n_models))
+ax4.set_xticklabels(clf_names, fontsize=10, rotation=12, ha='right')
+ax4.set_ylim(0, 115); ax4.set_ylabel('Accuracy (%)', fontsize=11)
+ax4.set_title(f'TEST Accuracy — All Classifiers\n{FEAT_LABEL} '
+              f'Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+ax4.grid(axis='y', alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig(f'/content/test_accuracy_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_accuracy_{SAVE_TAG}.png')
+
+# ── Final summary table ───────────────────────────────────────────────────────
+split_names = ['TRAIN','VAL','TEST']
+print(f"\n{'═'*100}")
+print(f"  FINAL COMPARISON TABLE")
+print(f"  Feature : {FEAT_LABEL}")
+print(f"  Quant   : Scheme 1 (1-bit sign) | SNR range {SNR_MIN}–{SNR_MAX} dB")
+print(f"{'═'*100}")
+header = f"  {'Model':<20}"
+for s in split_names:
+    header += f"  {s+' Acc':>9} {s+' F1':>9}"
+print(header); print(f"  {'-'*92}")
+for cn in clf_names:
+    row = f"  {cn:<20}"
+    for s in split_names:
+        r = master_results[cn][s]
+        row += f"  {r['acc']*100:>8.2f}% {r['f1']*100:>8.2f}%"
+    print(row)
+
+print(f"\n{'─'*100}")
+print(f"  OVERFIT CHECK (Train Acc − Val Acc)")
+for cn in clf_names:
+    gap  = master_results[cn]['TRAIN']['acc'] - master_results[cn]['VAL']['acc']
+    flag = ('✅ No overfit' if abs(gap)<0.05 else
+            '⚠️ Slight'    if abs(gap)<0.10 else '❌ Overfit')
+    print(f"  {cn:<20} {gap*100:>+7.2f}%  {flag}")
+
+print(f"\n  BEST TEST F1  → {sorted_names[0]}  ({sorted_f1s[0]:.2f}%)")
+print(f"{'═'*100}")
+print(f"\n✅ All done!")
+# ════════════════════════════════════════════════════════
+# CELL 0  Libraries and import of drive
+# ════════════════════════════════════════════════════════
+!pip install pyroomacoustics soundfile librosa -q
+
+import os, glob, shutil, hashlib
+import numpy as np
+import librosa
+import pyroomacoustics as pra
+from collections import defaultdict
+from google.colab import drive
+drive.mount('/content/drive')
+print("✅ Imports done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 1 — STEP 1: EXPLORE DATASET
+# ════════════════════════════════════════════════════════
+SPLIT_BASE   = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_WAV_SPLIT'
+TRAIN_WAV_DIR = os.path.join(SPLIT_BASE, 'train')
+VAL_WAV_DIR   = os.path.join(SPLIT_BASE, 'val')
+TEST_WAV_DIR  = os.path.join(SPLIT_BASE, 'test')
+
+train_files = sorted(glob.glob(os.path.join(TRAIN_WAV_DIR, '**', '*.wav'), recursive=True))
+val_files   = sorted(glob.glob(os.path.join(VAL_WAV_DIR,   '**', '*.wav'), recursive=True))
+test_files  = sorted(glob.glob(os.path.join(TEST_WAV_DIR,  '**', '*.wav'), recursive=True))
+
+def summarise_split(file_list, split_name):
+    speakers = set()
+    dr_info  = defaultdict(lambda: {'F': 0, 'M': 0, 'files': 0, 'speakers': set()})
+    for path in file_list:
+        parts  = path.split('/')
+        dr, spk = parts[-3], parts[-2]
+        gender = 'F' if spk.startswith('F') else 'M'
+        speakers.add(spk)
+        dr_info[dr]['files'] += 1
+        dr_info[dr][gender]  += 1
+        dr_info[dr]['speakers'].add(spk)
+    return speakers, dr_info
+
+print(f"{'='*65}")
+print(f"  DATASET OVERVIEW — SAMPLE_WAV_SPLIT")
+print(f"{'='*65}")
+print(f"  {'Split':8s} {'Files':>8} {'Speakers':>10} {'Female':>8} {'Male':>8}")
+print(f"  {'-'*46}")
+for split_name, file_list in [('Train', train_files), ('Valid', val_files), ('Test', test_files)]:
+    spks, _ = summarise_split(file_list, split_name)
+    f = sum(1 for p in file_list if p.split('/')[-2].startswith('F'))
+    m = len(file_list) - f
+    print(f"  {split_name:8s} {len(file_list):>8} {len(spks):>10} {f:>8} {m:>8}")
+print(f"\n✅ Step 1 done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 2 — STEP 2: CHOOSE FILE COUNTS
+# ════════════════════════════════════════════════════════
+N_TRAIN = 500
+N_VAL   = 100
+N_TEST  = 100
+SEED    = 42
+
+assert N_TRAIN <= len(train_files)
+assert N_VAL   <= len(val_files)
+assert N_TEST  <= len(test_files)
+
+import random
+rng = random.Random(SEED)
+tr = train_files.copy(); rng.shuffle(tr); train_chosen = tr[:N_TRAIN]
+vl = val_files.copy();   rng.shuffle(vl); val_chosen   = vl[:N_VAL]
+te = test_files.copy();  rng.shuffle(te); test_chosen  = te[:N_TEST]
+
+print(f"  {'Split':8s} {'Chosen':>8}")
+for name, chosen in [('Train', train_chosen), ('Valid', val_chosen), ('Test', test_chosen)]:
+    print(f"  {name:8s} {len(chosen):>8}")
+print(f"\n✅ Step 2 done — {N_TRAIN}/{N_VAL}/{N_TEST} files selected!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3A — WRITE speech_quantization.py
+# ════════════════════════════════════════════════════════
+quant_code = '''
+import numpy as np
+
+MU = 255
+A  = 87.6
+
+def normalise(x):
+    x    = np.asarray(x, dtype=np.float64)
+    peak = np.max(np.abs(x))
+    return x if peak == 0.0 else x / peak
+
+def mu_law_compress(x, mu=MU):
+    x = np.clip(x, -1.0, 1.0)
+    return np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+
+def a_law_compress(x, a=A):
+    x   = np.clip(x, -1.0, 1.0)
+    ax  = np.abs(x)
+    lna = np.log(a)
+    out = np.where(ax <= 1.0/a,
+                   a * ax / (1.0 + lna),
+                   (1.0 + np.log(a * ax + 1e-12)) / (1.0 + lna))
+    return np.sign(x) * np.clip(out, 0.0, 1.0)
+
+def _uniform_midtread(x, bit_depth):
+    delta = 2.0 ** (1 - bit_depth)
+    x_q   = delta * np.round(x / delta)
+    return np.clip(x_q, -(1.0 - delta/2.0), 1.0 - delta/2.0)
+
+def _log2_quantize(x, bit_depth):
+    x     = np.clip(x, -1.0, 1.0)
+    sign  = np.sign(x)
+    mag   = np.abs(x)
+    eps   = 2.0 ** -(2 ** (bit_depth - 1))
+    log_mag  = np.log2(np.where(mag < eps, eps, mag))
+    log_min  = -float(2 ** (bit_depth - 1))
+    log_norm = np.clip(log_mag / (-log_min), 0.0, 1.0)
+    levels   = 2 ** (bit_depth - 1)
+    log_q    = np.round(log_norm * (levels - 1)) / (levels - 1)
+    mag_q    = 2.0 ** (log_q * log_min)
+    return np.where(sign == 0, 0.0, sign * mag_q)
+
+def quantize(x, scheme, bit_depth=1, mu=MU, a=A):
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, -1.0, 1.0)
+    if scheme == 1: return np.where(x > 0, 1.0, -1.0)
+    if scheme == 6: return x.copy()
+    if scheme == 2: return _uniform_midtread(x, bit_depth)
+    if scheme == 3: return _uniform_midtread(mu_law_compress(x, mu), bit_depth)
+    if scheme == 4: return _uniform_midtread(a_law_compress(x, a), bit_depth)
+    if scheme == 5: return _log2_quantize(x, bit_depth)
+    raise ValueError(f"Unknown scheme: {scheme}")
+'''
+with open('/content/speech_quantization.py', 'w') as f:
+    f.write(quant_code)
+
+from speech_quantization import quantize, normalise
+print("✅ speech_quantization.py written and imported!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3B — DEREVERBERATION HELPER
+# ════════════════════════════════════════════════════════
+SR          = 16000
+MASTER_SEED = 42
+
+derev_params = {
+    "t60_range"          : [0.1, 2.5],
+    "dim_range"          : [5, 15, 5, 15, 2, 6],
+    "min_distance_to_wall": 1.0
+}
+
+def apply_dereverberation(speech, seed):
+    np.random.seed(seed)
+
+    t60 = np.random.uniform(*derev_params["t60_range"])
+    room_dim = np.array([
+        np.random.uniform(derev_params["dim_range"][2*n],
+                          derev_params["dim_range"][2*n+1])
+        for n in range(3)
+    ])
+    center_mic = np.array([
+        np.random.uniform(derev_params["min_distance_to_wall"],
+                          room_dim[n] - derev_params["min_distance_to_wall"])
+        for n in range(3)
+    ])
+
+    for _ in range(100):
+        source_pos = np.array([
+            np.random.uniform(derev_params["min_distance_to_wall"],
+                              room_dim[n] - derev_params["min_distance_to_wall"])
+            for n in range(3)
+        ])
+        if np.linalg.norm(source_pos - center_mic) >= 0.5:
+            break
+
+    n_mics  = np.random.randint(1, 5)
+    radius  = np.random.uniform(0.05, 0.5)
+    mic_array_2d = pra.beamforming.circular_2D_array(
+        center_mic[:-1], n_mics, phi0=0, radius=radius)
+    mic_array = np.pad(mic_array_2d, ((0,1),(0,0)),
+                       mode='constant', constant_values=center_mic[-1])
+
+    e_abs, max_order = pra.inverse_sabine(t60, room_dim)
+    use_ray = np.random.rand() > 0.5
+
+    rev_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(e_abs),
+                           max_order=min(3, max_order),
+                           ray_tracing=use_ray)
+    if use_ray:
+        rev_room.set_ray_tracing()
+    rev_room.add_microphone_array(mic_array)
+    rev_room.add_source(source_pos, signal=speech)
+    rev_room.compute_rir(); rev_room.simulate()
+
+    t60_real     = np.mean(rev_room.measure_rt60()).squeeze()
+    lossy_speech = np.squeeze(np.array(rev_room.mic_array.signals))
+    if lossy_speech.ndim > 1:
+        lossy_speech = lossy_speech[0]
+
+    dry_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(0.99),
+                           max_order=0)
+    dry_room.add_microphone_array(mic_array)
+    dry_room.add_source(source_pos, signal=speech)
+    dry_room.compute_rir(); dry_room.simulate()
+
+    speech_out = np.squeeze(np.array(dry_room.mic_array.signals))
+    if speech_out.ndim > 1:
+        speech_out = speech_out[0]
+
+    # Internal low-level noise (very high SNR, not the additive noise stage)
+    snr_db      = np.random.uniform(30, 60)
+    noise_power = (1/speech_out.shape[0]) * np.sum(speech_out**2) \
+                  * np.power(10, -snr_db/10)
+    noise_dur   = np.random.uniform(0.2, 1.0)
+    noise_sig   = np.random.randn(int(noise_dur * SR)) * np.sqrt(noise_power)
+    speech_out  = np.concatenate([speech_out, noise_sig])
+
+    min_len = min(lossy_speech.shape[0], speech_out.shape[0])
+    return speech_out[:min_len], lossy_speech[:min_len], t60_real
+
+print("✅ Dereverberation helper ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3C — NOISE INJECTION HELPERS
+# ════════════════════════════════════════════════════════
+
+# ── Directory containing NoiseX-92 .wav files ───────────────────────────────
+NOISE_DIR  = '/content/drive/MyDrive/DATASET_IISC/NoiseX'
+
+# SNR range (dB) sampled uniformly per utterance
+SNR_MIN, SNR_MAX = 0.0, 20.0     # adjust to taste
+
+def _get_noise_files(noise_dir):
+    """Return sorted list of all .wav files in noise_dir."""
+    files = sorted([
+        os.path.join(noise_dir, f)
+        for f in os.listdir(noise_dir)
+        if f.lower().endswith('.wav')
+    ])
+    assert len(files) > 0, f"❌ No .wav files found in {noise_dir}"
+    return files
+
+# Pre-load the file list once
+_NOISE_FILES = _get_noise_files(NOISE_DIR)
+print(f"✅ Found {len(_NOISE_FILES)} noise file(s) in {NOISE_DIR}:")
+for f in _NOISE_FILES:
+    print(f"   {os.path.basename(f)}")
+
+
+def _match_length(noise, length):
+    """
+    Trim or tile `noise` so its length equals `length`.
+    """
+    n = len(noise)
+    if n >= length:
+        start = np.random.randint(0, n - length + 1)
+        return noise[start : start + length]
+    repeats = int(np.ceil(length / n))
+    return np.tile(noise, repeats)[:length]
+
+
+def add_noise(clean_raw, reverb_raw, rng_seed):
+    """
+    Randomly pick one NoiseX file, scale it to a random SNR,
+    and add the SAME noise realisation to both clean and reverb signals.
+
+    Parameters
+    ----------
+    clean_raw  : 1-D float64 array  — dry (room-simulated clean) speech
+    reverb_raw : 1-D float64 array  — reverberant speech (same length)
+    rng_seed   : int                — reproducible seed for this utterance
+
+    Returns
+    -------
+    clean_noisy  : noisy clean signal
+    reverb_noisy : noisy reverberant signal
+    chosen_noise : basename of the selected noise file
+    snr_db       : SNR actually applied (dB)
+    """
+    np.random.seed(rng_seed)
+
+    # Step 1 — randomly choose one noise file
+    noise_path   = _NOISE_FILES[np.random.randint(len(_NOISE_FILES))]
+    noise_signal, _ = librosa.load(noise_path, sr=SR, mono=True)
+    noise_signal = noise_signal.astype(np.float64)
+
+    # Step 2 — match noise length to speech length
+    length       = len(clean_raw)
+    noise_matched = _match_length(noise_signal, length)
+
+    # Step 3 — randomly choose SNR
+    snr_db = np.random.uniform(SNR_MIN, SNR_MAX)
+
+    # Step 4 — compute powers (SNR anchored to clean speech)
+    speech_power = np.mean(clean_raw ** 2)
+    noise_power  = np.mean(noise_matched ** 2)
+
+    if noise_power < 1e-12 or speech_power < 1e-12:
+        # silent signal / silent noise — return as-is
+        return clean_raw.copy(), reverb_raw.copy(), os.path.basename(noise_path), snr_db
+
+    # Step 5 — scale noise to desired SNR
+    desired_noise_power = speech_power / (10 ** (snr_db / 10))
+    scale_factor        = np.sqrt(desired_noise_power / (noise_power + 1e-10))
+    scaled_noise        = noise_matched * scale_factor
+
+    # Step 6 — add SAME scaled noise to both signals
+    clean_noisy  = clean_raw  + scaled_noise
+    reverb_noisy = reverb_raw + scaled_noise
+
+    return clean_noisy, reverb_noisy, os.path.basename(noise_path), snr_db
+
+print("✅ Noise injection helpers ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3D — STEP 3: APPLY REVERBERATION + NOISE + QUANTIZATION
+#
+# Processing chain per utterance:
+#   speech.wav
+#     └─ apply_dereverberation()
+#           ├─ clean_raw   (dry)
+#           └─ reverb_raw  (reverberant)
+#                 └─ add_noise()   ← NEW
+#                       ├─ clean_noisy
+#                       └─ reverb_noisy
+#                             └─ normalise()
+#                                   └─ quantize(scheme=1, 1-bit)
+#                                         ├─ clean_q   → *_clean_q.npy
+#                                         └─ reverb_q  → *_reverb_q.npy
+# ════════════════════════════════════════════════════════
+SAVE_BASE     = '/content/drive/MyDrive/DATASET_IISC/processed'
+TRAIN_NPY_DIR = os.path.join(SAVE_BASE, 'train')
+VAL_NPY_DIR   = os.path.join(SAVE_BASE, 'val')
+TEST_NPY_DIR  = os.path.join(SAVE_BASE, 'test')
+
+for d in [TRAIN_NPY_DIR, VAL_NPY_DIR, TEST_NPY_DIR]:
+    if os.path.exists(d): shutil.rmtree(d)
+    os.makedirs(d)
+    print(f"✅ Created: {d}")
+
+splits      = [('train', train_chosen, TRAIN_NPY_DIR),
+               ('val',   val_chosen,   VAL_NPY_DIR),
+               ('test',  test_chosen,  TEST_NPY_DIR)]
+total_files = N_TRAIN + N_VAL + N_TEST
+global_idx  = 0
+
+for split_name, file_list, out_dir in splits:
+    print(f"\n{'='*70}")
+    print(f"  {split_name.upper()} — {len(file_list)} files")
+    print(f"{'='*70}")
+
+    for wav_path in file_list:
+        global_idx += 1
+
+        # Reproducible per-utterance seed (path-based)
+        seed = int(
+            hashlib.md5(f"{MASTER_SEED}_{wav_path}".encode()).hexdigest(), 16
+        ) % (2**31)
+
+        dr  = wav_path.split('/')[-3]
+        spk = wav_path.split('/')[-2]
+        utt = os.path.splitext(os.path.basename(wav_path))[0]
+
+        print(f"  [{global_idx:04d}/{total_files}] {spk}/{utt}  seed={seed}", end=' ')
+
+        # ── Load speech ────────────────────────────────────────────────────
+        speech = librosa.load(wav_path, sr=SR, mono=True)[0].astype(np.float64)
+
+        # ── Stage 1: Room simulation ───────────────────────────────────────
+        try:
+            clean_raw, reverb_raw, t60 = apply_dereverberation(speech, seed)
+        except Exception as e:
+            print(f"⚠️  SKIPPED (dereverberation failed: {e})")
+            continue
+
+        # ── Stage 2: Noise injection (same noise → clean & reverb) ────────
+        # Use a derived seed so noise randomness is independent of room seed
+        noise_seed = (seed + 1) % (2**31)
+        try:
+            clean_noisy, reverb_noisy, noise_name, snr_db = add_noise(
+                clean_raw, reverb_raw, noise_seed
+            )
+        except Exception as e:
+            print(f"⚠️  SKIPPED (noise injection failed: {e})")
+            continue
+
+        # ── Stage 3: Normalise ─────────────────────────────────────────────
+        clean_norm  = normalise(clean_noisy)
+        reverb_norm = normalise(reverb_noisy)
+
+        # ── Stage 4: 1-bit sign quantization ──────────────────────────────
+        clean_q  = quantize(clean_norm,  scheme=2, bit_depth=2)
+        reverb_q = quantize(reverb_norm, scheme=2, bit_depth=2)
+
+        # ── Save ───────────────────────────────────────────────────────────
+        tag = f"{dr}_{spk}_{utt}_t60={t60:.2f}_snr={snr_db:.1f}dB"
+        np.save(os.path.join(out_dir, f"{tag}_clean_q.npy"),  clean_q)
+        np.save(os.path.join(out_dir, f"{tag}_reverb_q.npy"), reverb_q)
+
+        print(f"T60={t60:.3f}s  SNR={snr_db:.1f}dB  "
+              f"noise={noise_name}  len={len(clean_q)}")
+
+print(f"\n✅ Step 3 done — .npy files saved to {SAVE_BASE}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4A — CLEAR FEATURE FOLDER
+# ════════════════════════════════════════════════════════
+FEAT_DIR = '/content/drive/MyDrive/DATASET_IISC/features_zcr_meanac_sc_sro_se_sf_6dim'
+if os.path.exists(FEAT_DIR): shutil.rmtree(FEAT_DIR)
+os.makedirs(FEAT_DIR, exist_ok=True)
+print(f"✅ Fresh feature folder: {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4B — STEP 4: COMPUTE 6-DIM FEATURE VECTOR
+# ════════════════════════════════════════════════════════
+N_AC_LAGS        = 3
+N_FEATURES       = 6
+ROLLOFF_PERCENT  = 0.85
+LOG_EPS          = 1e-12
+
+def compute_zcr(signal):
+    signs = np.sign(signal); signs[signs == 0] = 1
+    return float(np.sum(np.diff(signs) != 0) / (len(signal) - 1))
+
+def compute_mean_autocorr(signal, n_lags=N_AC_LAGS):
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    if energy == 0.0: return 0.0
+    ac = np.array([np.sum(signal[:-k] * signal[k:]) / energy
+                   for k in range(1, n_lags + 1)])
+    return float(np.mean(ac))
+
+def compute_spectral_centroid(signal, sr):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    return float(np.sum(freqs * mag) / total)
+
+def compute_spectral_rolloff(signal, sr, roll_percent=ROLLOFF_PERCENT):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs   = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    cum_mag = np.cumsum(mag)
+    idx     = min(np.searchsorted(cum_mag, roll_percent * total), len(freqs) - 1)
+    return float(freqs[idx])
+
+def compute_spectral_entropy(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    total = np.sum(power)
+    if total == 0.0: return 0.0
+    P = power / total
+    return float(-np.sum(P * np.log2(P + LOG_EPS)) / np.log2(len(P)))
+
+def compute_spectral_flatness(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    if np.sum(power) == 0.0: return 0.0
+    return float(np.exp(np.mean(np.log(power + LOG_EPS))) /
+                 (np.mean(power) + LOG_EPS))
+
+def compute_features(signal_q, sr):
+    return np.array([
+        compute_zcr(signal_q),
+        compute_mean_autocorr(signal_q, N_AC_LAGS),
+        compute_spectral_centroid(signal_q, sr),
+        compute_spectral_rolloff(signal_q, sr, ROLLOFF_PERCENT),
+        compute_spectral_entropy(signal_q),
+        compute_spectral_flatness(signal_q),
+    ], dtype=np.float64)
+
+def process_feature_split(npy_dir, split_name):
+    all_files   = sorted(os.listdir(npy_dir))
+    clean_files = [f for f in all_files if f.endswith('_clean_q.npy')]
+    reverb_files= [f for f in all_files if f.endswith('_reverb_q.npy')]
+    assert len(clean_files) == len(reverb_files)
+
+    print(f"\n  {split_name.upper()} — {len(clean_files)} pairs")
+    X, y = [], []
+    for cf, rf in zip(clean_files, reverb_files):
+        cq = np.load(os.path.join(npy_dir, cf))
+        rq = np.load(os.path.join(npy_dir, rf))
+        fc = compute_features(cq, SR)
+        fr = compute_features(rq, SR)
+        X.extend([fc, fr]); y.extend([0, 1])
+        print(f"  {cf[:30]:30s}  "
+              f"ZCR={fc[0]:.4f}/{fr[0]:.4f}  "
+              f"mAC={fc[1]:.4f}/{fr[1]:.4f}  "
+              f"SC={fc[2]:.1f}/{fr[2]:.1f}Hz")
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+print(f"{'='*70}")
+print(f"  STEP 4: Computing 6-dim feature vector")
+print(f"  [ZCR | mean_AC(lags 1..{N_AC_LAGS}) | SC | SRO | SE | SF]")
+print(f"  ALL features on 1-bit QUANTIZED noisy signal")
+print(f"{'='*70}")
+
+X_train_raw, y_train_raw = process_feature_split(TRAIN_NPY_DIR, 'train')
+X_val,        y_val       = process_feature_split(VAL_NPY_DIR,   'val')
+X_test,       y_test      = process_feature_split(TEST_NPY_DIR,  'test')
+
+rng_tr = np.random.default_rng(seed=SEED)
+idx    = rng_tr.permutation(len(y_train_raw))
+X_train, y_train = X_train_raw[idx], y_train_raw[idx]
+
+for name, arr in [('X_train', X_train), ('X_val', X_val), ('X_test', X_test)]:
+    nc, ic = np.isnan(arr).sum(), np.isinf(arr).sum()
+    print(f"  {name}: NaN={nc} Inf={ic} {'✅' if nc==0 and ic==0 else '❌'}")
+
+np.save(os.path.join(FEAT_DIR, 'feat_train_X.npy'), X_train)
+np.save(os.path.join(FEAT_DIR, 'feat_train_y.npy'), y_train)
+np.save(os.path.join(FEAT_DIR, 'feat_val_X.npy'),   X_val)
+np.save(os.path.join(FEAT_DIR, 'feat_val_y.npy'),   y_val)
+np.save(os.path.join(FEAT_DIR, 'feat_test_X.npy'),  X_test)
+np.save(os.path.join(FEAT_DIR, 'feat_test_y.npy'),  y_test)
+print(f"\n✅ Step 4 done! Features saved → {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 5 — MULTI-CLASSIFIER COMPARISON
+# ════════════════════════════════════════════════════════
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from IPython.display import Image
+%matplotlib inline
+
+from sklearn.svm                 import SVC
+from sklearn.ensemble            import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model        import LogisticRegression
+from sklearn.neighbors           import KNeighborsClassifier
+from sklearn.naive_bayes         import GaussianNB
+from sklearn.preprocessing       import StandardScaler
+from sklearn.metrics             import (accuracy_score, precision_score, recall_score,
+                                         f1_score, classification_report,
+                                         confusion_matrix, ConfusionMatrixDisplay)
+
+X_train = np.load(os.path.join(FEAT_DIR, 'feat_train_X.npy'))
+y_train = np.load(os.path.join(FEAT_DIR, 'feat_train_y.npy'))
+X_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_X.npy'))
+y_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_y.npy'))
+X_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_X.npy'))
+y_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_y.npy'))
+
+scaler      = StandardScaler()
+X_train_sc  = scaler.fit_transform(X_train)
+X_val_sc    = scaler.transform(X_val)
+X_test_sc   = scaler.transform(X_test)
+
+classifiers = {
+    'SVM'           : SVC(kernel='rbf', C=1.0, gamma='scale', random_state=SEED),
+    'Random Forest' : RandomForestClassifier(n_estimators=200, max_depth=4,
+                          min_samples_leaf=10, min_samples_split=10,
+                          max_features='sqrt', random_state=SEED, n_jobs=-1),
+    'Logistic Reg.' : LogisticRegression(max_iter=1000, solver='lbfgs',
+                          multi_class='auto', random_state=SEED),
+    'KNN'           : KNeighborsClassifier(n_neighbors=15, metric='minkowski', n_jobs=-1),
+    'Gradient Boost': GradientBoostingClassifier(n_estimators=80, learning_rate=0.03,
+                          max_depth=2, min_samples_leaf=10, subsample=0.8,
+                          random_state=SEED),
+    'Naive Bayes'   : GaussianNB(),
+}
+
+eval_splits  = [('TRAIN', X_train_sc, y_train),
+                ('VAL',   X_val_sc,   y_val),
+                ('TEST',  X_test_sc,  y_test)]
+FEAT_LABEL   = '[ZCR | mean_AC | Spec_Centroid | Spec_Rolloff | Spec_Entropy | Spec_Flatness]'
+SAVE_TAG     = '6dim'
+split_colors = {'TRAIN': 'steelblue', 'VAL': 'seagreen', 'TEST': 'tomato'}
+clf_names    = list(classifiers.keys())
+n_models     = len(clf_names)
+
+master_results = {}
+for clf_name, clf in classifiers.items():
+    print(f"\n{'═'*65}\n  CLASSIFIER : {clf_name}\n{'═'*65}")
+    clf.fit(X_train_sc, y_train)
+    master_results[clf_name] = {}
+    for split_name, X_sc, y_true in eval_splits:
+        y_pred = clf.predict(X_sc)
+        master_results[clf_name][split_name] = dict(
+            acc  = accuracy_score(y_true, y_pred),
+            prec = precision_score(y_true, y_pred, average='macro', zero_division=0),
+            rec  = recall_score  (y_true, y_pred, average='macro', zero_division=0),
+            f1   = f1_score      (y_true, y_pred, average='macro', zero_division=0),
+            cm   = confusion_matrix(y_true, y_pred),
+            report = classification_report(y_true, y_pred,
+                         target_names=['Clean(0)', 'Reverb(1)'], zero_division=0),
+            y_pred=y_pred, y_true=y_true)
+        r = master_results[clf_name][split_name]
+        print(f"\n  ── {split_name}")
+        print(f"  Accuracy : {r['acc']*100:6.2f}%  F1 : {r['f1']*100:6.2f}%")
+        print(r['report'])
+
+# ── Plot 1 — Confusion matrices ──────────────────────────────────────────────
+fig, axes = plt.subplots(n_models, 3, figsize=(13, 3.5*n_models))
+fig.suptitle(f'Confusion Matrices — All Classifiers\n'
+             f'{FEAT_LABEL} ({N_FEATURES} dims)\n'
+             f'Scheme 1 (1-bit) | Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+             fontsize=13, fontweight='bold', y=1.01)
+for row, cn in enumerate(clf_names):
+    for col, (sn, _, _) in enumerate(eval_splits):
+        res = master_results[cn][sn]
+        ConfusionMatrixDisplay(res['cm'],
+            display_labels=['Clean','Reverb']).plot(
+            ax=axes[row][col], colorbar=False, cmap='Blues')
+        axes[row][col].set_title(
+            f"{cn} — {sn}\nAcc={res['acc']*100:.1f}% F1={res['f1']*100:.1f}%",
+            fontweight='bold', color=split_colors[sn], fontsize=8)
+plt.tight_layout()
+plt.savefig(f'/content/cm_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/cm_all_models_{SAVE_TAG}.png')
+
+# ── Plot 2 — Metric bars ─────────────────────────────────────────────────────
+metric_colors = ['steelblue','seagreen','goldenrod','tomato']
+metric_keys   = ['acc','prec','rec','f1']
+metric_labels = ['Accuracy','Precision','Recall','F1 (macro)']
+x = np.arange(n_models); width = 0.18
+
+fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
+fig2.suptitle(f'All Classifiers — Acc / Prec / Recall / F1\n'
+              f'{FEAT_LABEL} Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+for col, (sn, _, _) in enumerate(eval_splits):
+    ax = axes2[col]
+    for i, (mk, ml, mc) in enumerate(zip(metric_keys, metric_labels, metric_colors)):
+        vals  = [master_results[cn][sn][mk]*100 for cn in clf_names]
+        bars  = ax.bar(x+(i-1.5)*width, vals, width,
+                       label=ml, color=mc, edgecolor='white', linewidth=0.6)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.6,
+                    f'{val:.1f}', ha='center', va='bottom',
+                    fontsize=5.5, fontweight='bold', rotation=90)
+    ax.set_ylim(0, 125); ax.set_xticks(x)
+    ax.set_xticklabels(clf_names, fontsize=8, rotation=15, ha='right')
+    ax.set_title(sn, fontweight='bold', color=split_colors[sn], fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    if col == 0: ax.legend(fontsize=8, loc='upper right')
+plt.tight_layout()
+plt.savefig(f'/content/metrics_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/metrics_all_models_{SAVE_TAG}.png')
+
+# ── Plot 3 — TEST F1 ranking ──────────────────────────────────────────────────
+test_f1s      = sorted([(cn, master_results[cn]['TEST']['f1']*100) for cn in clf_names],
+                        key=lambda x: x[1], reverse=True)
+sorted_names, sorted_f1s = zip(*test_f1s)
+fig3, ax3 = plt.subplots(figsize=(9, 4))
+ax3.barh(sorted_names, sorted_f1s,
+         color=plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(sorted_names))),
+         edgecolor='white')
+ax3.set_xlim(0, 115); ax3.invert_yaxis()
+ax3.set_xlabel('Test F1 — macro (%)', fontsize=10)
+ax3.set_title(f'TEST F1 Ranking — All Classifiers\n{FEAT_LABEL}', fontweight='bold')
+ax3.grid(axis='x', alpha=0.3)
+for i, (bar, val) in enumerate(zip(ax3.patches, sorted_f1s)):
+    ax3.text(val+0.8, bar.get_y()+bar.get_height()/2,
+             f'{val:.2f}%', va='center', fontsize=9, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'/content/test_f1_ranking_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_f1_ranking_{SAVE_TAG}.png')
+
+# ── Plot 4 — TEST Accuracy bar ────────────────────────────────────────────────
+acc_vals = [master_results[cn]['TEST']['acc']*100 for cn in clf_names]
+bar_cols = plt.cm.RdYlGn(np.linspace(0.3, 0.9, n_models))
+fig4, ax4 = plt.subplots(figsize=(12, 5))
+bars = ax4.bar(np.arange(n_models), acc_vals, color=bar_cols, edgecolor='white', width=0.5)
+for bar, val in zip(bars, acc_vals):
+    ax4.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+             f'{val:.2f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+best_idx = int(np.argmax(acc_vals))
+bars[best_idx].set_edgecolor('gold'); bars[best_idx].set_linewidth(2.5)
+ax4.text(best_idx, max(acc_vals)+3, f'★ Best\n{clf_names[best_idx]}',
+         ha='center', fontsize=8, color='goldenrod', fontweight='bold')
+ax4.set_xticks(np.arange(n_models))
+ax4.set_xticklabels(clf_names, fontsize=10, rotation=12, ha='right')
+ax4.set_ylim(0, 115); ax4.set_ylabel('Accuracy (%)', fontsize=11)
+ax4.set_title(f'TEST Accuracy — All Classifiers\n{FEAT_LABEL} '
+              f'Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+ax4.grid(axis='y', alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig(f'/content/test_accuracy_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_accuracy_{SAVE_TAG}.png')
+
+# ── Final summary table ───────────────────────────────────────────────────────
+split_names = ['TRAIN','VAL','TEST']
+print(f"\n{'═'*100}")
+print(f"  FINAL COMPARISON TABLE")
+print(f"  Feature : {FEAT_LABEL}")
+print(f"  Quant   : Scheme 1 (1-bit sign) | SNR range {SNR_MIN}–{SNR_MAX} dB")
+print(f"{'═'*100}")
+header = f"  {'Model':<20}"
+for s in split_names:
+    header += f"  {s+' Acc':>9} {s+' F1':>9}"
+print(header); print(f"  {'-'*92}")
+for cn in clf_names:
+    row = f"  {cn:<20}"
+    for s in split_names:
+        r = master_results[cn][s]
+        row += f"  {r['acc']*100:>8.2f}% {r['f1']*100:>8.2f}%"
+    print(row)
+
+print(f"\n{'─'*100}")
+print(f"  OVERFIT CHECK (Train Acc − Val Acc)")
+for cn in clf_names:
+    gap  = master_results[cn]['TRAIN']['acc'] - master_results[cn]['VAL']['acc']
+    flag = ('✅ No overfit' if abs(gap)<0.05 else
+            '⚠️ Slight'    if abs(gap)<0.10 else '❌ Overfit')
+    print(f"  {cn:<20} {gap*100:>+7.2f}%  {flag}")
+
+print(f"\n  BEST TEST F1  → {sorted_names[0]}  ({sorted_f1s[0]:.2f}%)")
+print(f"{'═'*100}")
+print(f"\n✅ All done!")
+# ════════════════════════════════════════════════════════
+# CELL 0  Libraries and import of drive
+# ════════════════════════════════════════════════════════
+!pip install pyroomacoustics soundfile librosa -q
+
+import os, glob, shutil, hashlib
+import numpy as np
+import librosa
+import pyroomacoustics as pra
+from collections import defaultdict
+from google.colab import drive
+drive.mount('/content/drive')
+print("✅ Imports done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 1 — STEP 1: EXPLORE DATASET
+# ════════════════════════════════════════════════════════
+SPLIT_BASE   = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_WAV_SPLIT'
+TRAIN_WAV_DIR = os.path.join(SPLIT_BASE, 'train')
+VAL_WAV_DIR   = os.path.join(SPLIT_BASE, 'val')
+TEST_WAV_DIR  = os.path.join(SPLIT_BASE, 'test')
+
+train_files = sorted(glob.glob(os.path.join(TRAIN_WAV_DIR, '**', '*.wav'), recursive=True))
+val_files   = sorted(glob.glob(os.path.join(VAL_WAV_DIR,   '**', '*.wav'), recursive=True))
+test_files  = sorted(glob.glob(os.path.join(TEST_WAV_DIR,  '**', '*.wav'), recursive=True))
+
+def summarise_split(file_list, split_name):
+    speakers = set()
+    dr_info  = defaultdict(lambda: {'F': 0, 'M': 0, 'files': 0, 'speakers': set()})
+    for path in file_list:
+        parts  = path.split('/')
+        dr, spk = parts[-3], parts[-2]
+        gender = 'F' if spk.startswith('F') else 'M'
+        speakers.add(spk)
+        dr_info[dr]['files'] += 1
+        dr_info[dr][gender]  += 1
+        dr_info[dr]['speakers'].add(spk)
+    return speakers, dr_info
+
+print(f"{'='*65}")
+print(f"  DATASET OVERVIEW — SAMPLE_WAV_SPLIT")
+print(f"{'='*65}")
+print(f"  {'Split':8s} {'Files':>8} {'Speakers':>10} {'Female':>8} {'Male':>8}")
+print(f"  {'-'*46}")
+for split_name, file_list in [('Train', train_files), ('Valid', val_files), ('Test', test_files)]:
+    spks, _ = summarise_split(file_list, split_name)
+    f = sum(1 for p in file_list if p.split('/')[-2].startswith('F'))
+    m = len(file_list) - f
+    print(f"  {split_name:8s} {len(file_list):>8} {len(spks):>10} {f:>8} {m:>8}")
+print(f"\n✅ Step 1 done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 2 — STEP 2: CHOOSE FILE COUNTS
+# ════════════════════════════════════════════════════════
+N_TRAIN = 500
+N_VAL   = 100
+N_TEST  = 100
+SEED    = 42
+
+assert N_TRAIN <= len(train_files)
+assert N_VAL   <= len(val_files)
+assert N_TEST  <= len(test_files)
+
+import random
+rng = random.Random(SEED)
+tr = train_files.copy(); rng.shuffle(tr); train_chosen = tr[:N_TRAIN]
+vl = val_files.copy();   rng.shuffle(vl); val_chosen   = vl[:N_VAL]
+te = test_files.copy();  rng.shuffle(te); test_chosen  = te[:N_TEST]
+
+print(f"  {'Split':8s} {'Chosen':>8}")
+for name, chosen in [('Train', train_chosen), ('Valid', val_chosen), ('Test', test_chosen)]:
+    print(f"  {name:8s} {len(chosen):>8}")
+print(f"\n✅ Step 2 done — {N_TRAIN}/{N_VAL}/{N_TEST} files selected!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3A — WRITE speech_quantization.py
+# ════════════════════════════════════════════════════════
+quant_code = '''
+import numpy as np
+
+MU = 255
+A  = 87.6
+
+def normalise(x):
+    x    = np.asarray(x, dtype=np.float64)
+    peak = np.max(np.abs(x))
+    return x if peak == 0.0 else x / peak
+
+def mu_law_compress(x, mu=MU):
+    x = np.clip(x, -1.0, 1.0)
+    return np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+
+def a_law_compress(x, a=A):
+    x   = np.clip(x, -1.0, 1.0)
+    ax  = np.abs(x)
+    lna = np.log(a)
+    out = np.where(ax <= 1.0/a,
+                   a * ax / (1.0 + lna),
+                   (1.0 + np.log(a * ax + 1e-12)) / (1.0 + lna))
+    return np.sign(x) * np.clip(out, 0.0, 1.0)
+
+def _uniform_midtread(x, bit_depth):
+    delta = 2.0 ** (1 - bit_depth)
+    x_q   = delta * np.round(x / delta)
+    return np.clip(x_q, -(1.0 - delta/2.0), 1.0 - delta/2.0)
+
+def _log2_quantize(x, bit_depth):
+    x     = np.clip(x, -1.0, 1.0)
+    sign  = np.sign(x)
+    mag   = np.abs(x)
+    eps   = 2.0 ** -(2 ** (bit_depth - 1))
+    log_mag  = np.log2(np.where(mag < eps, eps, mag))
+    log_min  = -float(2 ** (bit_depth - 1))
+    log_norm = np.clip(log_mag / (-log_min), 0.0, 1.0)
+    levels   = 2 ** (bit_depth - 1)
+    log_q    = np.round(log_norm * (levels - 1)) / (levels - 1)
+    mag_q    = 2.0 ** (log_q * log_min)
+    return np.where(sign == 0, 0.0, sign * mag_q)
+
+def quantize(x, scheme, bit_depth=1, mu=MU, a=A):
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, -1.0, 1.0)
+    if scheme == 1: return np.where(x > 0, 1.0, -1.0)
+    if scheme == 6: return x.copy()
+    if scheme == 2: return _uniform_midtread(x, bit_depth)
+    if scheme == 3: return _uniform_midtread(mu_law_compress(x, mu), bit_depth)
+    if scheme == 4: return _uniform_midtread(a_law_compress(x, a), bit_depth)
+    if scheme == 5: return _log2_quantize(x, bit_depth)
+    raise ValueError(f"Unknown scheme: {scheme}")
+'''
+with open('/content/speech_quantization.py', 'w') as f:
+    f.write(quant_code)
+
+from speech_quantization import quantize, normalise
+print("✅ speech_quantization.py written and imported!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3B — DEREVERBERATION HELPER
+# ════════════════════════════════════════════════════════
+SR          = 16000
+MASTER_SEED = 42
+
+derev_params = {
+    "t60_range"          : [0.1, 2.5],
+    "dim_range"          : [5, 15, 5, 15, 2, 6],
+    "min_distance_to_wall": 1.0
+}
+
+def apply_dereverberation(speech, seed):
+    np.random.seed(seed)
+
+    t60 = np.random.uniform(*derev_params["t60_range"])
+    room_dim = np.array([
+        np.random.uniform(derev_params["dim_range"][2*n],
+                          derev_params["dim_range"][2*n+1])
+        for n in range(3)
+    ])
+    center_mic = np.array([
+        np.random.uniform(derev_params["min_distance_to_wall"],
+                          room_dim[n] - derev_params["min_distance_to_wall"])
+        for n in range(3)
+    ])
+
+    for _ in range(100):
+        source_pos = np.array([
+            np.random.uniform(derev_params["min_distance_to_wall"],
+                              room_dim[n] - derev_params["min_distance_to_wall"])
+            for n in range(3)
+        ])
+        if np.linalg.norm(source_pos - center_mic) >= 0.5:
+            break
+
+    n_mics  = np.random.randint(1, 5)
+    radius  = np.random.uniform(0.05, 0.5)
+    mic_array_2d = pra.beamforming.circular_2D_array(
+        center_mic[:-1], n_mics, phi0=0, radius=radius)
+    mic_array = np.pad(mic_array_2d, ((0,1),(0,0)),
+                       mode='constant', constant_values=center_mic[-1])
+
+    e_abs, max_order = pra.inverse_sabine(t60, room_dim)
+    use_ray = np.random.rand() > 0.5
+
+    rev_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(e_abs),
+                           max_order=min(3, max_order),
+                           ray_tracing=use_ray)
+    if use_ray:
+        rev_room.set_ray_tracing()
+    rev_room.add_microphone_array(mic_array)
+    rev_room.add_source(source_pos, signal=speech)
+    rev_room.compute_rir(); rev_room.simulate()
+
+    t60_real     = np.mean(rev_room.measure_rt60()).squeeze()
+    lossy_speech = np.squeeze(np.array(rev_room.mic_array.signals))
+    if lossy_speech.ndim > 1:
+        lossy_speech = lossy_speech[0]
+
+    dry_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(0.99),
+                           max_order=0)
+    dry_room.add_microphone_array(mic_array)
+    dry_room.add_source(source_pos, signal=speech)
+    dry_room.compute_rir(); dry_room.simulate()
+
+    speech_out = np.squeeze(np.array(dry_room.mic_array.signals))
+    if speech_out.ndim > 1:
+        speech_out = speech_out[0]
+
+    # Internal low-level noise (very high SNR, not the additive noise stage)
+    snr_db      = np.random.uniform(30, 60)
+    noise_power = (1/speech_out.shape[0]) * np.sum(speech_out**2) \
+                  * np.power(10, -snr_db/10)
+    noise_dur   = np.random.uniform(0.2, 1.0)
+    noise_sig   = np.random.randn(int(noise_dur * SR)) * np.sqrt(noise_power)
+    speech_out  = np.concatenate([speech_out, noise_sig])
+
+    min_len = min(lossy_speech.shape[0], speech_out.shape[0])
+    return speech_out[:min_len], lossy_speech[:min_len], t60_real
+
+print("✅ Dereverberation helper ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3C — NOISE INJECTION HELPERS
+# ════════════════════════════════════════════════════════
+
+# ── Directory containing NoiseX-92 .wav files ───────────────────────────────
+NOISE_DIR  = '/content/drive/MyDrive/DATASET_IISC/NoiseX'
+
+# SNR range (dB) sampled uniformly per utterance
+SNR_MIN, SNR_MAX = 0.0, 20.0     # adjust to taste
+
+def _get_noise_files(noise_dir):
+    """Return sorted list of all .wav files in noise_dir."""
+    files = sorted([
+        os.path.join(noise_dir, f)
+        for f in os.listdir(noise_dir)
+        if f.lower().endswith('.wav')
+    ])
+    assert len(files) > 0, f"❌ No .wav files found in {noise_dir}"
+    return files
+
+# Pre-load the file list once
+_NOISE_FILES = _get_noise_files(NOISE_DIR)
+print(f"✅ Found {len(_NOISE_FILES)} noise file(s) in {NOISE_DIR}:")
+for f in _NOISE_FILES:
+    print(f"   {os.path.basename(f)}")
+
+
+def _match_length(noise, length):
+    """
+    Trim or tile `noise` so its length equals `length`.
+    """
+    n = len(noise)
+    if n >= length:
+        start = np.random.randint(0, n - length + 1)
+        return noise[start : start + length]
+    repeats = int(np.ceil(length / n))
+    return np.tile(noise, repeats)[:length]
+
+
+def add_noise(clean_raw, reverb_raw, rng_seed):
+    """
+    Randomly pick one NoiseX file, scale it to a random SNR,
+    and add the SAME noise realisation to both clean and reverb signals.
+
+    Parameters
+    ----------
+    clean_raw  : 1-D float64 array  — dry (room-simulated clean) speech
+    reverb_raw : 1-D float64 array  — reverberant speech (same length)
+    rng_seed   : int                — reproducible seed for this utterance
+
+    Returns
+    -------
+    clean_noisy  : noisy clean signal
+    reverb_noisy : noisy reverberant signal
+    chosen_noise : basename of the selected noise file
+    snr_db       : SNR actually applied (dB)
+    """
+    np.random.seed(rng_seed)
+
+    # Step 1 — randomly choose one noise file
+    noise_path   = _NOISE_FILES[np.random.randint(len(_NOISE_FILES))]
+    noise_signal, _ = librosa.load(noise_path, sr=SR, mono=True)
+    noise_signal = noise_signal.astype(np.float64)
+
+    # Step 2 — match noise length to speech length
+    length       = len(clean_raw)
+    noise_matched = _match_length(noise_signal, length)
+
+    # Step 3 — randomly choose SNR
+    snr_db = np.random.uniform(SNR_MIN, SNR_MAX)
+
+    # Step 4 — compute powers (SNR anchored to clean speech)
+    speech_power = np.mean(clean_raw ** 2)
+    noise_power  = np.mean(noise_matched ** 2)
+
+    if noise_power < 1e-12 or speech_power < 1e-12:
+        # silent signal / silent noise — return as-is
+        return clean_raw.copy(), reverb_raw.copy(), os.path.basename(noise_path), snr_db
+
+    # Step 5 — scale noise to desired SNR
+    desired_noise_power = speech_power / (10 ** (snr_db / 10))
+    scale_factor        = np.sqrt(desired_noise_power / (noise_power + 1e-10))
+    scaled_noise        = noise_matched * scale_factor
+
+    # Step 6 — add SAME scaled noise to both signals
+    clean_noisy  = clean_raw  + scaled_noise
+    reverb_noisy = reverb_raw + scaled_noise
+
+    return clean_noisy, reverb_noisy, os.path.basename(noise_path), snr_db
+
+print("✅ Noise injection helpers ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3D — STEP 3: APPLY REVERBERATION + NOISE + QUANTIZATION
+#
+# Processing chain per utterance:
+#   speech.wav
+#     └─ apply_dereverberation()
+#           ├─ clean_raw   (dry)
+#           └─ reverb_raw  (reverberant)
+#                 └─ add_noise()   ← NEW
+#                       ├─ clean_noisy
+#                       └─ reverb_noisy
+#                             └─ normalise()
+#                                   └─ quantize(scheme=1, 1-bit)
+#                                         ├─ clean_q   → *_clean_q.npy
+#                                         └─ reverb_q  → *_reverb_q.npy
+# ════════════════════════════════════════════════════════
+SAVE_BASE     = '/content/drive/MyDrive/DATASET_IISC/processed'
+TRAIN_NPY_DIR = os.path.join(SAVE_BASE, 'train')
+VAL_NPY_DIR   = os.path.join(SAVE_BASE, 'val')
+TEST_NPY_DIR  = os.path.join(SAVE_BASE, 'test')
+
+for d in [TRAIN_NPY_DIR, VAL_NPY_DIR, TEST_NPY_DIR]:
+    if os.path.exists(d): shutil.rmtree(d)
+    os.makedirs(d)
+    print(f"✅ Created: {d}")
+
+splits      = [('train', train_chosen, TRAIN_NPY_DIR),
+               ('val',   val_chosen,   VAL_NPY_DIR),
+               ('test',  test_chosen,  TEST_NPY_DIR)]
+total_files = N_TRAIN + N_VAL + N_TEST
+global_idx  = 0
+
+for split_name, file_list, out_dir in splits:
+    print(f"\n{'='*70}")
+    print(f"  {split_name.upper()} — {len(file_list)} files")
+    print(f"{'='*70}")
+
+    for wav_path in file_list:
+        global_idx += 1
+
+        # Reproducible per-utterance seed (path-based)
+        seed = int(
+            hashlib.md5(f"{MASTER_SEED}_{wav_path}".encode()).hexdigest(), 16
+        ) % (2**31)
+
+        dr  = wav_path.split('/')[-3]
+        spk = wav_path.split('/')[-2]
+        utt = os.path.splitext(os.path.basename(wav_path))[0]
+
+        print(f"  [{global_idx:04d}/{total_files}] {spk}/{utt}  seed={seed}", end=' ')
+
+        # ── Load speech ────────────────────────────────────────────────────
+        speech = librosa.load(wav_path, sr=SR, mono=True)[0].astype(np.float64)
+
+        # ── Stage 1: Room simulation ───────────────────────────────────────
+        try:
+            clean_raw, reverb_raw, t60 = apply_dereverberation(speech, seed)
+        except Exception as e:
+            print(f"⚠️  SKIPPED (dereverberation failed: {e})")
+            continue
+
+        # ── Stage 2: Noise injection (same noise → clean & reverb) ────────
+        # Use a derived seed so noise randomness is independent of room seed
+        noise_seed = (seed + 1) % (2**31)
+        try:
+            clean_noisy, reverb_noisy, noise_name, snr_db = add_noise(
+                clean_raw, reverb_raw, noise_seed
+            )
+        except Exception as e:
+            print(f"⚠️  SKIPPED (noise injection failed: {e})")
+            continue
+
+        # ── Stage 3: Normalise ─────────────────────────────────────────────
+        clean_norm  = normalise(clean_noisy)
+        reverb_norm = normalise(reverb_noisy)
+
+        # ── Stage 4: 1-bit sign quantization ──────────────────────────────
+        clean_q  = quantize(clean_norm,  scheme=2, bit_depth=4)
+        reverb_q = quantize(reverb_norm, scheme=2, bit_depth=4)
+
+        # ── Save ───────────────────────────────────────────────────────────
+        tag = f"{dr}_{spk}_{utt}_t60={t60:.2f}_snr={snr_db:.1f}dB"
+        np.save(os.path.join(out_dir, f"{tag}_clean_q.npy"),  clean_q)
+        np.save(os.path.join(out_dir, f"{tag}_reverb_q.npy"), reverb_q)
+
+        print(f"T60={t60:.3f}s  SNR={snr_db:.1f}dB  "
+              f"noise={noise_name}  len={len(clean_q)}")
+
+print(f"\n✅ Step 3 done — .npy files saved to {SAVE_BASE}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4A — CLEAR FEATURE FOLDER
+# ════════════════════════════════════════════════════════
+FEAT_DIR = '/content/drive/MyDrive/DATASET_IISC/features_zcr_meanac_sc_sro_se_sf_6dim'
+if os.path.exists(FEAT_DIR): shutil.rmtree(FEAT_DIR)
+os.makedirs(FEAT_DIR, exist_ok=True)
+print(f"✅ Fresh feature folder: {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4B — STEP 4: COMPUTE 6-DIM FEATURE VECTOR
+# ════════════════════════════════════════════════════════
+N_AC_LAGS        = 3
+N_FEATURES       = 6
+ROLLOFF_PERCENT  = 0.85
+LOG_EPS          = 1e-12
+
+def compute_zcr(signal):
+    signs = np.sign(signal); signs[signs == 0] = 1
+    return float(np.sum(np.diff(signs) != 0) / (len(signal) - 1))
+
+def compute_mean_autocorr(signal, n_lags=N_AC_LAGS):
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    if energy == 0.0: return 0.0
+    ac = np.array([np.sum(signal[:-k] * signal[k:]) / energy
+                   for k in range(1, n_lags + 1)])
+    return float(np.mean(ac))
+
+def compute_spectral_centroid(signal, sr):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    return float(np.sum(freqs * mag) / total)
+
+def compute_spectral_rolloff(signal, sr, roll_percent=ROLLOFF_PERCENT):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs   = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    cum_mag = np.cumsum(mag)
+    idx     = min(np.searchsorted(cum_mag, roll_percent * total), len(freqs) - 1)
+    return float(freqs[idx])
+
+def compute_spectral_entropy(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    total = np.sum(power)
+    if total == 0.0: return 0.0
+    P = power / total
+    return float(-np.sum(P * np.log2(P + LOG_EPS)) / np.log2(len(P)))
+
+def compute_spectral_flatness(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    if np.sum(power) == 0.0: return 0.0
+    return float(np.exp(np.mean(np.log(power + LOG_EPS))) /
+                 (np.mean(power) + LOG_EPS))
+
+def compute_features(signal_q, sr):
+    return np.array([
+        compute_zcr(signal_q),
+        compute_mean_autocorr(signal_q, N_AC_LAGS),
+        compute_spectral_centroid(signal_q, sr),
+        compute_spectral_rolloff(signal_q, sr, ROLLOFF_PERCENT),
+        compute_spectral_entropy(signal_q),
+        compute_spectral_flatness(signal_q),
+    ], dtype=np.float64)
+
+def process_feature_split(npy_dir, split_name):
+    all_files   = sorted(os.listdir(npy_dir))
+    clean_files = [f for f in all_files if f.endswith('_clean_q.npy')]
+    reverb_files= [f for f in all_files if f.endswith('_reverb_q.npy')]
+    assert len(clean_files) == len(reverb_files)
+
+    print(f"\n  {split_name.upper()} — {len(clean_files)} pairs")
+    X, y = [], []
+    for cf, rf in zip(clean_files, reverb_files):
+        cq = np.load(os.path.join(npy_dir, cf))
+        rq = np.load(os.path.join(npy_dir, rf))
+        fc = compute_features(cq, SR)
+        fr = compute_features(rq, SR)
+        X.extend([fc, fr]); y.extend([0, 1])
+        print(f"  {cf[:30]:30s}  "
+              f"ZCR={fc[0]:.4f}/{fr[0]:.4f}  "
+              f"mAC={fc[1]:.4f}/{fr[1]:.4f}  "
+              f"SC={fc[2]:.1f}/{fr[2]:.1f}Hz")
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+print(f"{'='*70}")
+print(f"  STEP 4: Computing 6-dim feature vector")
+print(f"  [ZCR | mean_AC(lags 1..{N_AC_LAGS}) | SC | SRO | SE | SF]")
+print(f"  ALL features on 1-bit QUANTIZED noisy signal")
+print(f"{'='*70}")
+
+X_train_raw, y_train_raw = process_feature_split(TRAIN_NPY_DIR, 'train')
+X_val,        y_val       = process_feature_split(VAL_NPY_DIR,   'val')
+X_test,       y_test      = process_feature_split(TEST_NPY_DIR,  'test')
+
+rng_tr = np.random.default_rng(seed=SEED)
+idx    = rng_tr.permutation(len(y_train_raw))
+X_train, y_train = X_train_raw[idx], y_train_raw[idx]
+
+for name, arr in [('X_train', X_train), ('X_val', X_val), ('X_test', X_test)]:
+    nc, ic = np.isnan(arr).sum(), np.isinf(arr).sum()
+    print(f"  {name}: NaN={nc} Inf={ic} {'✅' if nc==0 and ic==0 else '❌'}")
+
+np.save(os.path.join(FEAT_DIR, 'feat_train_X.npy'), X_train)
+np.save(os.path.join(FEAT_DIR, 'feat_train_y.npy'), y_train)
+np.save(os.path.join(FEAT_DIR, 'feat_val_X.npy'),   X_val)
+np.save(os.path.join(FEAT_DIR, 'feat_val_y.npy'),   y_val)
+np.save(os.path.join(FEAT_DIR, 'feat_test_X.npy'),  X_test)
+np.save(os.path.join(FEAT_DIR, 'feat_test_y.npy'),  y_test)
+print(f"\n✅ Step 4 done! Features saved → {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 5 — MULTI-CLASSIFIER COMPARISON
+# ════════════════════════════════════════════════════════
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from IPython.display import Image
+%matplotlib inline
+
+from sklearn.svm                 import SVC
+from sklearn.ensemble            import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model        import LogisticRegression
+from sklearn.neighbors           import KNeighborsClassifier
+from sklearn.naive_bayes         import GaussianNB
+from sklearn.preprocessing       import StandardScaler
+from sklearn.metrics             import (accuracy_score, precision_score, recall_score,
+                                         f1_score, classification_report,
+                                         confusion_matrix, ConfusionMatrixDisplay)
+
+X_train = np.load(os.path.join(FEAT_DIR, 'feat_train_X.npy'))
+y_train = np.load(os.path.join(FEAT_DIR, 'feat_train_y.npy'))
+X_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_X.npy'))
+y_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_y.npy'))
+X_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_X.npy'))
+y_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_y.npy'))
+
+scaler      = StandardScaler()
+X_train_sc  = scaler.fit_transform(X_train)
+X_val_sc    = scaler.transform(X_val)
+X_test_sc   = scaler.transform(X_test)
+
+classifiers = {
+    'SVM'           : SVC(kernel='rbf', C=1.0, gamma='scale', random_state=SEED),
+    'Random Forest' : RandomForestClassifier(n_estimators=200, max_depth=4,
+                          min_samples_leaf=10, min_samples_split=10,
+                          max_features='sqrt', random_state=SEED, n_jobs=-1),
+    'Logistic Reg.' : LogisticRegression(max_iter=1000, solver='lbfgs',
+                          multi_class='auto', random_state=SEED),
+    'KNN'           : KNeighborsClassifier(n_neighbors=15, metric='minkowski', n_jobs=-1),
+    'Gradient Boost': GradientBoostingClassifier(n_estimators=80, learning_rate=0.03,
+                          max_depth=2, min_samples_leaf=10, subsample=0.8,
+                          random_state=SEED),
+    'Naive Bayes'   : GaussianNB(),
+}
+
+eval_splits  = [('TRAIN', X_train_sc, y_train),
+                ('VAL',   X_val_sc,   y_val),
+                ('TEST',  X_test_sc,  y_test)]
+FEAT_LABEL   = '[ZCR | mean_AC | Spec_Centroid | Spec_Rolloff | Spec_Entropy | Spec_Flatness]'
+SAVE_TAG     = '6dim'
+split_colors = {'TRAIN': 'steelblue', 'VAL': 'seagreen', 'TEST': 'tomato'}
+clf_names    = list(classifiers.keys())
+n_models     = len(clf_names)
+
+master_results = {}
+for clf_name, clf in classifiers.items():
+    print(f"\n{'═'*65}\n  CLASSIFIER : {clf_name}\n{'═'*65}")
+    clf.fit(X_train_sc, y_train)
+    master_results[clf_name] = {}
+    for split_name, X_sc, y_true in eval_splits:
+        y_pred = clf.predict(X_sc)
+        master_results[clf_name][split_name] = dict(
+            acc  = accuracy_score(y_true, y_pred),
+            prec = precision_score(y_true, y_pred, average='macro', zero_division=0),
+            rec  = recall_score  (y_true, y_pred, average='macro', zero_division=0),
+            f1   = f1_score      (y_true, y_pred, average='macro', zero_division=0),
+            cm   = confusion_matrix(y_true, y_pred),
+            report = classification_report(y_true, y_pred,
+                         target_names=['Clean(0)', 'Reverb(1)'], zero_division=0),
+            y_pred=y_pred, y_true=y_true)
+        r = master_results[clf_name][split_name]
+        print(f"\n  ── {split_name}")
+        print(f"  Accuracy : {r['acc']*100:6.2f}%  F1 : {r['f1']*100:6.2f}%")
+        print(r['report'])
+
+# ── Plot 1 — Confusion matrices ──────────────────────────────────────────────
+fig, axes = plt.subplots(n_models, 3, figsize=(13, 3.5*n_models))
+fig.suptitle(f'Confusion Matrices — All Classifiers\n'
+             f'{FEAT_LABEL} ({N_FEATURES} dims)\n'
+             f'Scheme 1 (1-bit) | Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+             fontsize=13, fontweight='bold', y=1.01)
+for row, cn in enumerate(clf_names):
+    for col, (sn, _, _) in enumerate(eval_splits):
+        res = master_results[cn][sn]
+        ConfusionMatrixDisplay(res['cm'],
+            display_labels=['Clean','Reverb']).plot(
+            ax=axes[row][col], colorbar=False, cmap='Blues')
+        axes[row][col].set_title(
+            f"{cn} — {sn}\nAcc={res['acc']*100:.1f}% F1={res['f1']*100:.1f}%",
+            fontweight='bold', color=split_colors[sn], fontsize=8)
+plt.tight_layout()
+plt.savefig(f'/content/cm_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/cm_all_models_{SAVE_TAG}.png')
+
+# ── Plot 2 — Metric bars ─────────────────────────────────────────────────────
+metric_colors = ['steelblue','seagreen','goldenrod','tomato']
+metric_keys   = ['acc','prec','rec','f1']
+metric_labels = ['Accuracy','Precision','Recall','F1 (macro)']
+x = np.arange(n_models); width = 0.18
+
+fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
+fig2.suptitle(f'All Classifiers — Acc / Prec / Recall / F1\n'
+              f'{FEAT_LABEL} Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+for col, (sn, _, _) in enumerate(eval_splits):
+    ax = axes2[col]
+    for i, (mk, ml, mc) in enumerate(zip(metric_keys, metric_labels, metric_colors)):
+        vals  = [master_results[cn][sn][mk]*100 for cn in clf_names]
+        bars  = ax.bar(x+(i-1.5)*width, vals, width,
+                       label=ml, color=mc, edgecolor='white', linewidth=0.6)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.6,
+                    f'{val:.1f}', ha='center', va='bottom',
+                    fontsize=5.5, fontweight='bold', rotation=90)
+    ax.set_ylim(0, 125); ax.set_xticks(x)
+    ax.set_xticklabels(clf_names, fontsize=8, rotation=15, ha='right')
+    ax.set_title(sn, fontweight='bold', color=split_colors[sn], fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    if col == 0: ax.legend(fontsize=8, loc='upper right')
+plt.tight_layout()
+plt.savefig(f'/content/metrics_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/metrics_all_models_{SAVE_TAG}.png')
+
+# ── Plot 3 — TEST F1 ranking ──────────────────────────────────────────────────
+test_f1s      = sorted([(cn, master_results[cn]['TEST']['f1']*100) for cn in clf_names],
+                        key=lambda x: x[1], reverse=True)
+sorted_names, sorted_f1s = zip(*test_f1s)
+fig3, ax3 = plt.subplots(figsize=(9, 4))
+ax3.barh(sorted_names, sorted_f1s,
+         color=plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(sorted_names))),
+         edgecolor='white')
+ax3.set_xlim(0, 115); ax3.invert_yaxis()
+ax3.set_xlabel('Test F1 — macro (%)', fontsize=10)
+ax3.set_title(f'TEST F1 Ranking — All Classifiers\n{FEAT_LABEL}', fontweight='bold')
+ax3.grid(axis='x', alpha=0.3)
+for i, (bar, val) in enumerate(zip(ax3.patches, sorted_f1s)):
+    ax3.text(val+0.8, bar.get_y()+bar.get_height()/2,
+             f'{val:.2f}%', va='center', fontsize=9, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'/content/test_f1_ranking_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_f1_ranking_{SAVE_TAG}.png')
+
+# ── Plot 4 — TEST Accuracy bar ────────────────────────────────────────────────
+acc_vals = [master_results[cn]['TEST']['acc']*100 for cn in clf_names]
+bar_cols = plt.cm.RdYlGn(np.linspace(0.3, 0.9, n_models))
+fig4, ax4 = plt.subplots(figsize=(12, 5))
+bars = ax4.bar(np.arange(n_models), acc_vals, color=bar_cols, edgecolor='white', width=0.5)
+for bar, val in zip(bars, acc_vals):
+    ax4.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+             f'{val:.2f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+best_idx = int(np.argmax(acc_vals))
+bars[best_idx].set_edgecolor('gold'); bars[best_idx].set_linewidth(2.5)
+ax4.text(best_idx, max(acc_vals)+3, f'★ Best\n{clf_names[best_idx]}',
+         ha='center', fontsize=8, color='goldenrod', fontweight='bold')
+ax4.set_xticks(np.arange(n_models))
+ax4.set_xticklabels(clf_names, fontsize=10, rotation=12, ha='right')
+ax4.set_ylim(0, 115); ax4.set_ylabel('Accuracy (%)', fontsize=11)
+ax4.set_title(f'TEST Accuracy — All Classifiers\n{FEAT_LABEL} '
+              f'Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+ax4.grid(axis='y', alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig(f'/content/test_accuracy_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_accuracy_{SAVE_TAG}.png')
+
+# ── Final summary table ───────────────────────────────────────────────────────
+split_names = ['TRAIN','VAL','TEST']
+print(f"\n{'═'*100}")
+print(f"  FINAL COMPARISON TABLE")
+print(f"  Feature : {FEAT_LABEL}")
+print(f"  Quant   : Scheme 1 (1-bit sign) | SNR range {SNR_MIN}–{SNR_MAX} dB")
+print(f"{'═'*100}")
+header = f"  {'Model':<20}"
+for s in split_names:
+    header += f"  {s+' Acc':>9} {s+' F1':>9}"
+print(header); print(f"  {'-'*92}")
+for cn in clf_names:
+    row = f"  {cn:<20}"
+    for s in split_names:
+        r = master_results[cn][s]
+        row += f"  {r['acc']*100:>8.2f}% {r['f1']*100:>8.2f}%"
+    print(row)
+
+print(f"\n{'─'*100}")
+print(f"  OVERFIT CHECK (Train Acc − Val Acc)")
+for cn in clf_names:
+    gap  = master_results[cn]['TRAIN']['acc'] - master_results[cn]['VAL']['acc']
+    flag = ('✅ No overfit' if abs(gap)<0.05 else
+            '⚠️ Slight'    if abs(gap)<0.10 else '❌ Overfit')
+    print(f"  {cn:<20} {gap*100:>+7.2f}%  {flag}")
+
+print(f"\n  BEST TEST F1  → {sorted_names[0]}  ({sorted_f1s[0]:.2f}%)")
+print(f"{'═'*100}")
+print(f"\n✅ All done!")
+# ════════════════════════════════════════════════════════
+# CELL 6 — PLOT: Accuracy vs Bit Depth (SVM ONLY)
+# ════════════════════════════════════════════════════════
+
+svm_results = {
+    1: {'TRAIN': 79.16, 'VAL': 78.06, 'TEST': 77.04},
+    2: {'TRAIN': 79.98, 'VAL': 78.06, 'TEST': 81.63},
+    4: {'TRAIN': 88.40, 'VAL': 86.73, 'TEST': 89.29},
+    # 8: {'TRAIN': ??, 'VAL': ??, 'TEST': ??},  # add when ready
+}
+
+bit_depths   = sorted(svm_results.keys())
+x_labels     = [f'{b}-bit\n({2**b} levels)' if b > 1 else '1-bit\n(sign)' for b in bit_depths]
+split_colors = {'TRAIN': 'steelblue', 'VAL': 'seagreen', 'TEST': 'tomato'}
+split_markers= {'TRAIN': 'o', 'VAL': 's', 'TEST': '^'}
+
+fig, ax = plt.subplots(figsize=(9, 6))
+
+for sn in ['TRAIN', 'VAL', 'TEST']:
+    vals = [svm_results[b][sn] for b in bit_depths]
+    ax.plot(x_labels, vals,
+            color=split_colors[sn], marker=split_markers[sn],
+            linewidth=2.5, markersize=9, label=sn)
+    for i, val in enumerate(vals):
+        ax.annotate(f'{val:.2f}%', (x_labels[i], val),
+                    textcoords='offset points', xytext=(0, 10),
+                    ha='center', fontsize=9,
+                    color=split_colors[sn], fontweight='bold')
+
+ax.set_ylim(65, 100)
+ax.set_xlabel('Quantization Bit Depth', fontsize=12)
+ax.set_ylabel('Accuracy (%)', fontsize=12)
+ax.set_title('SVM — Train / Val / Test Accuracy vs Bit Depth\nScheme 2 (Uniform Quantization)',
+             fontsize=13, fontweight='bold')
+ax.legend(fontsize=11)
+ax.grid(axis='y', alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig('/content/svm_acc_vs_bitdepth.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("✅ SVM plot saved!")
+# ════════════════════════════════════════════════════════
+# CELL 0  Libraries and import of drive
+# ════════════════════════════════════════════════════════
+!pip install pyroomacoustics soundfile librosa -q
+
+import os, glob, shutil, hashlib
+import numpy as np
+import librosa
+import pyroomacoustics as pra
+from collections import defaultdict
+from google.colab import drive
+drive.mount('/content/drive')
+print("✅ Imports done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 1 — STEP 1: EXPLORE DATASET
+# ════════════════════════════════════════════════════════
+SPLIT_BASE   = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_WAV_SPLIT'
+TRAIN_WAV_DIR = os.path.join(SPLIT_BASE, 'train')
+VAL_WAV_DIR   = os.path.join(SPLIT_BASE, 'val')
+TEST_WAV_DIR  = os.path.join(SPLIT_BASE, 'test')
+
+train_files = sorted(glob.glob(os.path.join(TRAIN_WAV_DIR, '**', '*.wav'), recursive=True))
+val_files   = sorted(glob.glob(os.path.join(VAL_WAV_DIR,   '**', '*.wav'), recursive=True))
+test_files  = sorted(glob.glob(os.path.join(TEST_WAV_DIR,  '**', '*.wav'), recursive=True))
+
+def summarise_split(file_list, split_name):
+    speakers = set()
+    dr_info  = defaultdict(lambda: {'F': 0, 'M': 0, 'files': 0, 'speakers': set()})
+    for path in file_list:
+        parts  = path.split('/')
+        dr, spk = parts[-3], parts[-2]
+        gender = 'F' if spk.startswith('F') else 'M'
+        speakers.add(spk)
+        dr_info[dr]['files'] += 1
+        dr_info[dr][gender]  += 1
+        dr_info[dr]['speakers'].add(spk)
+    return speakers, dr_info
+
+print(f"{'='*65}")
+print(f"  DATASET OVERVIEW — SAMPLE_WAV_SPLIT")
+print(f"{'='*65}")
+print(f"  {'Split':8s} {'Files':>8} {'Speakers':>10} {'Female':>8} {'Male':>8}")
+print(f"  {'-'*46}")
+for split_name, file_list in [('Train', train_files), ('Valid', val_files), ('Test', test_files)]:
+    spks, _ = summarise_split(file_list, split_name)
+    f = sum(1 for p in file_list if p.split('/')[-2].startswith('F'))
+    m = len(file_list) - f
+    print(f"  {split_name:8s} {len(file_list):>8} {len(spks):>10} {f:>8} {m:>8}")
+print(f"\n✅ Step 1 done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 2 — STEP 2: CHOOSE FILE COUNTS
+# ════════════════════════════════════════════════════════
+N_TRAIN = 500
+N_VAL   = 100
+N_TEST  = 100
+SEED    = 42
+
+assert N_TRAIN <= len(train_files)
+assert N_VAL   <= len(val_files)
+assert N_TEST  <= len(test_files)
+
+import random
+rng = random.Random(SEED)
+tr = train_files.copy(); rng.shuffle(tr); train_chosen = tr[:N_TRAIN]
+vl = val_files.copy();   rng.shuffle(vl); val_chosen   = vl[:N_VAL]
+te = test_files.copy();  rng.shuffle(te); test_chosen  = te[:N_TEST]
+
+print(f"  {'Split':8s} {'Chosen':>8}")
+for name, chosen in [('Train', train_chosen), ('Valid', val_chosen), ('Test', test_chosen)]:
+    print(f"  {name:8s} {len(chosen):>8}")
+print(f"\n✅ Step 2 done — {N_TRAIN}/{N_VAL}/{N_TEST} files selected!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3A — WRITE speech_quantization.py
+# ════════════════════════════════════════════════════════
+quant_code = '''
+import numpy as np
+
+MU = 255
+A  = 87.6
+
+def normalise(x):
+    x    = np.asarray(x, dtype=np.float64)
+    peak = np.max(np.abs(x))
+    return x if peak == 0.0 else x / peak
+
+def mu_law_compress(x, mu=MU):
+    x = np.clip(x, -1.0, 1.0)
+    return np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+
+def a_law_compress(x, a=A):
+    x   = np.clip(x, -1.0, 1.0)
+    ax  = np.abs(x)
+    lna = np.log(a)
+    out = np.where(ax <= 1.0/a,
+                   a * ax / (1.0 + lna),
+                   (1.0 + np.log(a * ax + 1e-12)) / (1.0 + lna))
+    return np.sign(x) * np.clip(out, 0.0, 1.0)
+
+def _uniform_midtread(x, bit_depth):
+    delta = 2.0 ** (1 - bit_depth)
+    x_q   = delta * np.round(x / delta)
+    return np.clip(x_q, -(1.0 - delta/2.0), 1.0 - delta/2.0)
+
+def _log2_quantize(x, bit_depth):
+    x     = np.clip(x, -1.0, 1.0)
+    sign  = np.sign(x)
+    mag   = np.abs(x)
+    eps   = 2.0 ** -(2 ** (bit_depth - 1))
+    log_mag  = np.log2(np.where(mag < eps, eps, mag))
+    log_min  = -float(2 ** (bit_depth - 1))
+    log_norm = np.clip(log_mag / (-log_min), 0.0, 1.0)
+    levels   = 2 ** (bit_depth - 1)
+    log_q    = np.round(log_norm * (levels - 1)) / (levels - 1)
+    mag_q    = 2.0 ** (log_q * log_min)
+    return np.where(sign == 0, 0.0, sign * mag_q)
+
+def quantize(x, scheme, bit_depth=1, mu=MU, a=A):
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, -1.0, 1.0)
+    if scheme == 1: return np.where(x > 0, 1.0, -1.0)
+    if scheme == 6: return x.copy()
+    if scheme == 2: return _uniform_midtread(x, bit_depth)
+    if scheme == 3: return _uniform_midtread(mu_law_compress(x, mu), bit_depth)
+    if scheme == 4: return _uniform_midtread(a_law_compress(x, a), bit_depth)
+    if scheme == 5: return _log2_quantize(x, bit_depth)
+    raise ValueError(f"Unknown scheme: {scheme}")
+'''
+with open('/content/speech_quantization.py', 'w') as f:
+    f.write(quant_code)
+
+from speech_quantization import quantize, normalise
+print("✅ speech_quantization.py written and imported!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3B — DEREVERBERATION HELPER
+# ════════════════════════════════════════════════════════
+SR          = 16000
+MASTER_SEED = 42
+
+derev_params = {
+    "t60_range"          : [0.1, 2.5],
+    "dim_range"          : [5, 15, 5, 15, 2, 6],
+    "min_distance_to_wall": 1.0
+}
+
+def apply_dereverberation(speech, seed):
+    np.random.seed(seed)
+
+    t60 = np.random.uniform(*derev_params["t60_range"])
+    room_dim = np.array([
+        np.random.uniform(derev_params["dim_range"][2*n],
+                          derev_params["dim_range"][2*n+1])
+        for n in range(3)
+    ])
+    center_mic = np.array([
+        np.random.uniform(derev_params["min_distance_to_wall"],
+                          room_dim[n] - derev_params["min_distance_to_wall"])
+        for n in range(3)
+    ])
+
+    for _ in range(100):
+        source_pos = np.array([
+            np.random.uniform(derev_params["min_distance_to_wall"],
+                              room_dim[n] - derev_params["min_distance_to_wall"])
+            for n in range(3)
+        ])
+        if np.linalg.norm(source_pos - center_mic) >= 0.5:
+            break
+
+    n_mics  = np.random.randint(1, 5)
+    radius  = np.random.uniform(0.05, 0.5)
+    mic_array_2d = pra.beamforming.circular_2D_array(
+        center_mic[:-1], n_mics, phi0=0, radius=radius)
+    mic_array = np.pad(mic_array_2d, ((0,1),(0,0)),
+                       mode='constant', constant_values=center_mic[-1])
+
+    e_abs, max_order = pra.inverse_sabine(t60, room_dim)
+    use_ray = np.random.rand() > 0.5
+
+    rev_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(e_abs),
+                           max_order=min(3, max_order),
+                           ray_tracing=use_ray)
+    if use_ray:
+        rev_room.set_ray_tracing()
+    rev_room.add_microphone_array(mic_array)
+    rev_room.add_source(source_pos, signal=speech)
+    rev_room.compute_rir(); rev_room.simulate()
+
+    t60_real     = np.mean(rev_room.measure_rt60()).squeeze()
+    lossy_speech = np.squeeze(np.array(rev_room.mic_array.signals))
+    if lossy_speech.ndim > 1:
+        lossy_speech = lossy_speech[0]
+
+    dry_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(0.99),
+                           max_order=0)
+    dry_room.add_microphone_array(mic_array)
+    dry_room.add_source(source_pos, signal=speech)
+    dry_room.compute_rir(); dry_room.simulate()
+
+    speech_out = np.squeeze(np.array(dry_room.mic_array.signals))
+    if speech_out.ndim > 1:
+        speech_out = speech_out[0]
+
+    # Internal low-level noise (very high SNR, not the additive noise stage)
+    snr_db      = np.random.uniform(30, 60)
+    noise_power = (1/speech_out.shape[0]) * np.sum(speech_out**2) \
+                  * np.power(10, -snr_db/10)
+    noise_dur   = np.random.uniform(0.2, 1.0)
+    noise_sig   = np.random.randn(int(noise_dur * SR)) * np.sqrt(noise_power)
+    speech_out  = np.concatenate([speech_out, noise_sig])
+
+    min_len = min(lossy_speech.shape[0], speech_out.shape[0])
+    return speech_out[:min_len], lossy_speech[:min_len], t60_real
+
+print("✅ Dereverberation helper ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3C — NOISE INJECTION HELPERS
+# ════════════════════════════════════════════════════════
+
+# ── Directory containing NoiseX-92 .wav files ───────────────────────────────
+NOISE_DIR  = '/content/drive/MyDrive/DATASET_IISC/NoiseX'
+
+# SNR range (dB) sampled uniformly per utterance
+SNR_MIN, SNR_MAX = 0.0, 20.0     # adjust to taste
+
+def _get_noise_files(noise_dir):
+    """Return sorted list of all .wav files in noise_dir."""
+    files = sorted([
+        os.path.join(noise_dir, f)
+        for f in os.listdir(noise_dir)
+        if f.lower().endswith('.wav')
+    ])
+    assert len(files) > 0, f"❌ No .wav files found in {noise_dir}"
+    return files
+
+# Pre-load the file list once
+_NOISE_FILES = _get_noise_files(NOISE_DIR)
+print(f"✅ Found {len(_NOISE_FILES)} noise file(s) in {NOISE_DIR}:")
+for f in _NOISE_FILES:
+    print(f"   {os.path.basename(f)}")
+
+
+def _match_length(noise, length):
+    """
+    Trim or tile `noise` so its length equals `length`.
+    """
+    n = len(noise)
+    if n >= length:
+        start = np.random.randint(0, n - length + 1)
+        return noise[start : start + length]
+    repeats = int(np.ceil(length / n))
+    return np.tile(noise, repeats)[:length]
+
+
+def add_noise(clean_raw, reverb_raw, rng_seed):
+    """
+    Randomly pick one NoiseX file, scale it to a random SNR,
+    and add the SAME noise realisation to both clean and reverb signals.
+
+    Parameters
+    ----------
+    clean_raw  : 1-D float64 array  — dry (room-simulated clean) speech
+    reverb_raw : 1-D float64 array  — reverberant speech (same length)
+    rng_seed   : int                — reproducible seed for this utterance
+
+    Returns
+    -------
+    clean_noisy  : noisy clean signal
+    reverb_noisy : noisy reverberant signal
+    chosen_noise : basename of the selected noise file
+    snr_db       : SNR actually applied (dB)
+    """
+    np.random.seed(rng_seed)
+
+    # Step 1 — randomly choose one noise file
+    noise_path   = _NOISE_FILES[np.random.randint(len(_NOISE_FILES))]
+    noise_signal, _ = librosa.load(noise_path, sr=SR, mono=True)
+    noise_signal = noise_signal.astype(np.float64)
+
+    # Step 2 — match noise length to speech length
+    length       = len(clean_raw)
+    noise_matched = _match_length(noise_signal, length)
+
+    # Step 3 — randomly choose SNR
+    snr_db = np.random.uniform(SNR_MIN, SNR_MAX)
+
+    # Step 4 — compute powers (SNR anchored to clean speech)
+    speech_power = np.mean(clean_raw ** 2)
+    noise_power  = np.mean(noise_matched ** 2)
+
+    if noise_power < 1e-12 or speech_power < 1e-12:
+        # silent signal / silent noise — return as-is
+        return clean_raw.copy(), reverb_raw.copy(), os.path.basename(noise_path), snr_db
+
+    # Step 5 — scale noise to desired SNR
+    desired_noise_power = speech_power / (10 ** (snr_db / 10))
+    scale_factor        = np.sqrt(desired_noise_power / (noise_power + 1e-10))
+    scaled_noise        = noise_matched * scale_factor
+
+    # Step 6 — add SAME scaled noise to both signals
+    clean_noisy  = clean_raw  + scaled_noise
+    reverb_noisy = reverb_raw + scaled_noise
+
+    return clean_noisy, reverb_noisy, os.path.basename(noise_path), snr_db
+
+print("✅ Noise injection helpers ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3D — STEP 3: APPLY REVERBERATION + NOISE + QUANTIZATION
+#
+# Processing chain per utterance:
+#   speech.wav
+#     └─ apply_dereverberation()
+#           ├─ clean_raw   (dry)
+#           └─ reverb_raw  (reverberant)
+#                 └─ add_noise()   ← NEW
+#                       ├─ clean_noisy
+#                       └─ reverb_noisy
+#                             └─ normalise()
+#                                   └─ quantize(scheme=1, 1-bit)
+#                                         ├─ clean_q   → *_clean_q.npy
+#                                         └─ reverb_q  → *_reverb_q.npy
+# ════════════════════════════════════════════════════════
+SAVE_BASE     = '/content/drive/MyDrive/DATASET_IISC/processed'
+TRAIN_NPY_DIR = os.path.join(SAVE_BASE, 'train')
+VAL_NPY_DIR   = os.path.join(SAVE_BASE, 'val')
+TEST_NPY_DIR  = os.path.join(SAVE_BASE, 'test')
+
+for d in [TRAIN_NPY_DIR, VAL_NPY_DIR, TEST_NPY_DIR]:
+    if os.path.exists(d): shutil.rmtree(d)
+    os.makedirs(d)
+    print(f"✅ Created: {d}")
+
+splits      = [('train', train_chosen, TRAIN_NPY_DIR),
+               ('val',   val_chosen,   VAL_NPY_DIR),
+               ('test',  test_chosen,  TEST_NPY_DIR)]
+total_files = N_TRAIN + N_VAL + N_TEST
+global_idx  = 0
+
+for split_name, file_list, out_dir in splits:
+    print(f"\n{'='*70}")
+    print(f"  {split_name.upper()} — {len(file_list)} files")
+    print(f"{'='*70}")
+
+    for wav_path in file_list:
+        global_idx += 1
+
+        # Reproducible per-utterance seed (path-based)
+        seed = int(
+            hashlib.md5(f"{MASTER_SEED}_{wav_path}".encode()).hexdigest(), 16
+        ) % (2**31)
+
+        dr  = wav_path.split('/')[-3]
+        spk = wav_path.split('/')[-2]
+        utt = os.path.splitext(os.path.basename(wav_path))[0]
+
+        print(f"  [{global_idx:04d}/{total_files}] {spk}/{utt}  seed={seed}", end=' ')
+
+        # ── Load speech ────────────────────────────────────────────────────
+        speech = librosa.load(wav_path, sr=SR, mono=True)[0].astype(np.float64)
+
+        # ── Stage 1: Room simulation ───────────────────────────────────────
+        try:
+            clean_raw, reverb_raw, t60 = apply_dereverberation(speech, seed)
+        except Exception as e:
+            print(f"⚠️  SKIPPED (dereverberation failed: {e})")
+            continue
+
+        # ── Stage 2: Noise injection (same noise → clean & reverb) ────────
+        # Use a derived seed so noise randomness is independent of room seed
+        noise_seed = (seed + 1) % (2**31)
+        try:
+            clean_noisy, reverb_noisy, noise_name, snr_db = add_noise(
+                clean_raw, reverb_raw, noise_seed
+            )
+        except Exception as e:
+            print(f"⚠️  SKIPPED (noise injection failed: {e})")
+            continue
+
+        # ── Stage 3: Normalise ─────────────────────────────────────────────
+        clean_norm  = normalise(clean_noisy)
+        reverb_norm = normalise(reverb_noisy)
+
+        # ── Stage 4: 1-bit sign quantization ──────────────────────────────
+        clean_q  = quantize(clean_norm,  scheme=3, bit_depth=4)
+        reverb_q = quantize(reverb_norm, scheme=3, bit_depth=4)
+
+        # ── Save ───────────────────────────────────────────────────────────
+        tag = f"{dr}_{spk}_{utt}_t60={t60:.2f}_snr={snr_db:.1f}dB"
+        np.save(os.path.join(out_dir, f"{tag}_clean_q.npy"),  clean_q)
+        np.save(os.path.join(out_dir, f"{tag}_reverb_q.npy"), reverb_q)
+
+        print(f"T60={t60:.3f}s  SNR={snr_db:.1f}dB  "
+              f"noise={noise_name}  len={len(clean_q)}")
+
+print(f"\n✅ Step 3 done — .npy files saved to {SAVE_BASE}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4A — CLEAR FEATURE FOLDER
+# ════════════════════════════════════════════════════════
+FEAT_DIR = '/content/drive/MyDrive/DATASET_IISC/features_zcr_meanac_sc_sro_se_sf_6dim'
+if os.path.exists(FEAT_DIR): shutil.rmtree(FEAT_DIR)
+os.makedirs(FEAT_DIR, exist_ok=True)
+print(f"✅ Fresh feature folder: {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4B — STEP 4: COMPUTE 6-DIM FEATURE VECTOR
+# ════════════════════════════════════════════════════════
+N_AC_LAGS        = 3
+N_FEATURES       = 6
+ROLLOFF_PERCENT  = 0.85
+LOG_EPS          = 1e-12
+
+def compute_zcr(signal):
+    signs = np.sign(signal); signs[signs == 0] = 1
+    return float(np.sum(np.diff(signs) != 0) / (len(signal) - 1))
+
+def compute_mean_autocorr(signal, n_lags=N_AC_LAGS):
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    if energy == 0.0: return 0.0
+    ac = np.array([np.sum(signal[:-k] * signal[k:]) / energy
+                   for k in range(1, n_lags + 1)])
+    return float(np.mean(ac))
+
+def compute_spectral_centroid(signal, sr):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    return float(np.sum(freqs * mag) / total)
+
+def compute_spectral_rolloff(signal, sr, roll_percent=ROLLOFF_PERCENT):
+    mag   = np.abs(np.fft.rfft(signal.astype(np.float64)))
+    total = np.sum(mag)
+    if total == 0.0: return 0.0
+    freqs   = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    cum_mag = np.cumsum(mag)
+    idx     = min(np.searchsorted(cum_mag, roll_percent * total), len(freqs) - 1)
+    return float(freqs[idx])
+
+def compute_spectral_entropy(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    total = np.sum(power)
+    if total == 0.0: return 0.0
+    P = power / total
+    return float(-np.sum(P * np.log2(P + LOG_EPS)) / np.log2(len(P)))
+
+def compute_spectral_flatness(signal):
+    power = np.abs(np.fft.rfft(signal.astype(np.float64))) ** 2
+    if np.sum(power) == 0.0: return 0.0
+    return float(np.exp(np.mean(np.log(power + LOG_EPS))) /
+                 (np.mean(power) + LOG_EPS))
+
+def compute_features(signal_q, sr):
+    return np.array([
+        compute_zcr(signal_q),
+        compute_mean_autocorr(signal_q, N_AC_LAGS),
+        compute_spectral_centroid(signal_q, sr),
+        compute_spectral_rolloff(signal_q, sr, ROLLOFF_PERCENT),
+        compute_spectral_entropy(signal_q),
+        compute_spectral_flatness(signal_q),
+    ], dtype=np.float64)
+
+def process_feature_split(npy_dir, split_name):
+    all_files   = sorted(os.listdir(npy_dir))
+    clean_files = [f for f in all_files if f.endswith('_clean_q.npy')]
+    reverb_files= [f for f in all_files if f.endswith('_reverb_q.npy')]
+    assert len(clean_files) == len(reverb_files)
+
+    print(f"\n  {split_name.upper()} — {len(clean_files)} pairs")
+    X, y = [], []
+    for cf, rf in zip(clean_files, reverb_files):
+        cq = np.load(os.path.join(npy_dir, cf))
+        rq = np.load(os.path.join(npy_dir, rf))
+        fc = compute_features(cq, SR)
+        fr = compute_features(rq, SR)
+        X.extend([fc, fr]); y.extend([0, 1])
+        print(f"  {cf[:30]:30s}  "
+              f"ZCR={fc[0]:.4f}/{fr[0]:.4f}  "
+              f"mAC={fc[1]:.4f}/{fr[1]:.4f}  "
+              f"SC={fc[2]:.1f}/{fr[2]:.1f}Hz")
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+print(f"{'='*70}")
+print(f"  STEP 4: Computing 6-dim feature vector")
+print(f"  [ZCR | mean_AC(lags 1..{N_AC_LAGS}) | SC | SRO | SE | SF]")
+print(f"  ALL features on 1-bit QUANTIZED noisy signal")
+print(f"{'='*70}")
+
+X_train_raw, y_train_raw = process_feature_split(TRAIN_NPY_DIR, 'train')
+X_val,        y_val       = process_feature_split(VAL_NPY_DIR,   'val')
+X_test,       y_test      = process_feature_split(TEST_NPY_DIR,  'test')
+
+rng_tr = np.random.default_rng(seed=SEED)
+idx    = rng_tr.permutation(len(y_train_raw))
+X_train, y_train = X_train_raw[idx], y_train_raw[idx]
+
+for name, arr in [('X_train', X_train), ('X_val', X_val), ('X_test', X_test)]:
+    nc, ic = np.isnan(arr).sum(), np.isinf(arr).sum()
+    print(f"  {name}: NaN={nc} Inf={ic} {'✅' if nc==0 and ic==0 else '❌'}")
+
+np.save(os.path.join(FEAT_DIR, 'feat_train_X.npy'), X_train)
+np.save(os.path.join(FEAT_DIR, 'feat_train_y.npy'), y_train)
+np.save(os.path.join(FEAT_DIR, 'feat_val_X.npy'),   X_val)
+np.save(os.path.join(FEAT_DIR, 'feat_val_y.npy'),   y_val)
+np.save(os.path.join(FEAT_DIR, 'feat_test_X.npy'),  X_test)
+np.save(os.path.join(FEAT_DIR, 'feat_test_y.npy'),  y_test)
+print(f"\n✅ Step 4 done! Features saved → {FEAT_DIR}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 5 — MULTI-CLASSIFIER COMPARISON
+# ════════════════════════════════════════════════════════
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from IPython.display import Image
+%matplotlib inline
+
+from sklearn.svm                 import SVC
+from sklearn.ensemble            import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model        import LogisticRegression
+from sklearn.neighbors           import KNeighborsClassifier
+from sklearn.naive_bayes         import GaussianNB
+from sklearn.preprocessing       import StandardScaler
+from sklearn.metrics             import (accuracy_score, precision_score, recall_score,
+                                         f1_score, classification_report,
+                                         confusion_matrix, ConfusionMatrixDisplay)
+
+X_train = np.load(os.path.join(FEAT_DIR, 'feat_train_X.npy'))
+y_train = np.load(os.path.join(FEAT_DIR, 'feat_train_y.npy'))
+X_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_X.npy'))
+y_val   = np.load(os.path.join(FEAT_DIR, 'feat_val_y.npy'))
+X_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_X.npy'))
+y_test  = np.load(os.path.join(FEAT_DIR, 'feat_test_y.npy'))
+
+scaler      = StandardScaler()
+X_train_sc  = scaler.fit_transform(X_train)
+X_val_sc    = scaler.transform(X_val)
+X_test_sc   = scaler.transform(X_test)
+
+classifiers = {
+    'SVM'           : SVC(kernel='rbf', C=1.0, gamma='scale', random_state=SEED),
+    'Random Forest' : RandomForestClassifier(n_estimators=200, max_depth=4,
+                          min_samples_leaf=10, min_samples_split=10,
+                          max_features='sqrt', random_state=SEED, n_jobs=-1),
+    'Logistic Reg.' : LogisticRegression(max_iter=1000, solver='lbfgs',
+                          multi_class='auto', random_state=SEED),
+    'KNN'           : KNeighborsClassifier(n_neighbors=15, metric='minkowski', n_jobs=-1),
+    'Gradient Boost': GradientBoostingClassifier(n_estimators=80, learning_rate=0.03,
+                          max_depth=2, min_samples_leaf=10, subsample=0.8,
+                          random_state=SEED),
+    'Naive Bayes'   : GaussianNB(),
+}
+
+eval_splits  = [('TRAIN', X_train_sc, y_train),
+                ('VAL',   X_val_sc,   y_val),
+                ('TEST',  X_test_sc,  y_test)]
+FEAT_LABEL   = '[ZCR | mean_AC | Spec_Centroid | Spec_Rolloff | Spec_Entropy | Spec_Flatness]'
+SAVE_TAG     = '6dim'
+split_colors = {'TRAIN': 'steelblue', 'VAL': 'seagreen', 'TEST': 'tomato'}
+clf_names    = list(classifiers.keys())
+n_models     = len(clf_names)
+
+master_results = {}
+for clf_name, clf in classifiers.items():
+    print(f"\n{'═'*65}\n  CLASSIFIER : {clf_name}\n{'═'*65}")
+    clf.fit(X_train_sc, y_train)
+    master_results[clf_name] = {}
+    for split_name, X_sc, y_true in eval_splits:
+        y_pred = clf.predict(X_sc)
+        master_results[clf_name][split_name] = dict(
+            acc  = accuracy_score(y_true, y_pred),
+            prec = precision_score(y_true, y_pred, average='macro', zero_division=0),
+            rec  = recall_score  (y_true, y_pred, average='macro', zero_division=0),
+            f1   = f1_score      (y_true, y_pred, average='macro', zero_division=0),
+            cm   = confusion_matrix(y_true, y_pred),
+            report = classification_report(y_true, y_pred,
+                         target_names=['Clean(0)', 'Reverb(1)'], zero_division=0),
+            y_pred=y_pred, y_true=y_true)
+        r = master_results[clf_name][split_name]
+        print(f"\n  ── {split_name}")
+        print(f"  Accuracy : {r['acc']*100:6.2f}%  F1 : {r['f1']*100:6.2f}%")
+        print(r['report'])
+
+# ── Plot 1 — Confusion matrices ──────────────────────────────────────────────
+fig, axes = plt.subplots(n_models, 3, figsize=(13, 3.5*n_models))
+fig.suptitle(f'Confusion Matrices — All Classifiers\n'
+             f'{FEAT_LABEL} ({N_FEATURES} dims)\n'
+             f'Scheme 1 (1-bit) | Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+             fontsize=13, fontweight='bold', y=1.01)
+for row, cn in enumerate(clf_names):
+    for col, (sn, _, _) in enumerate(eval_splits):
+        res = master_results[cn][sn]
+        ConfusionMatrixDisplay(res['cm'],
+            display_labels=['Clean','Reverb']).plot(
+            ax=axes[row][col], colorbar=False, cmap='Blues')
+        axes[row][col].set_title(
+            f"{cn} — {sn}\nAcc={res['acc']*100:.1f}% F1={res['f1']*100:.1f}%",
+            fontweight='bold', color=split_colors[sn], fontsize=8)
+plt.tight_layout()
+plt.savefig(f'/content/cm_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/cm_all_models_{SAVE_TAG}.png')
+
+# ── Plot 2 — Metric bars ─────────────────────────────────────────────────────
+metric_colors = ['steelblue','seagreen','goldenrod','tomato']
+metric_keys   = ['acc','prec','rec','f1']
+metric_labels = ['Accuracy','Precision','Recall','F1 (macro)']
+x = np.arange(n_models); width = 0.18
+
+fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
+fig2.suptitle(f'All Classifiers — Acc / Prec / Recall / F1\n'
+              f'{FEAT_LABEL} Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+for col, (sn, _, _) in enumerate(eval_splits):
+    ax = axes2[col]
+    for i, (mk, ml, mc) in enumerate(zip(metric_keys, metric_labels, metric_colors)):
+        vals  = [master_results[cn][sn][mk]*100 for cn in clf_names]
+        bars  = ax.bar(x+(i-1.5)*width, vals, width,
+                       label=ml, color=mc, edgecolor='white', linewidth=0.6)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.6,
+                    f'{val:.1f}', ha='center', va='bottom',
+                    fontsize=5.5, fontweight='bold', rotation=90)
+    ax.set_ylim(0, 125); ax.set_xticks(x)
+    ax.set_xticklabels(clf_names, fontsize=8, rotation=15, ha='right')
+    ax.set_title(sn, fontweight='bold', color=split_colors[sn], fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    if col == 0: ax.legend(fontsize=8, loc='upper right')
+plt.tight_layout()
+plt.savefig(f'/content/metrics_all_models_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/metrics_all_models_{SAVE_TAG}.png')
+
+# ── Plot 3 — TEST F1 ranking ──────────────────────────────────────────────────
+test_f1s      = sorted([(cn, master_results[cn]['TEST']['f1']*100) for cn in clf_names],
+                        key=lambda x: x[1], reverse=True)
+sorted_names, sorted_f1s = zip(*test_f1s)
+fig3, ax3 = plt.subplots(figsize=(9, 4))
+ax3.barh(sorted_names, sorted_f1s,
+         color=plt.cm.RdYlGn(np.linspace(0.3, 0.9, len(sorted_names))),
+         edgecolor='white')
+ax3.set_xlim(0, 115); ax3.invert_yaxis()
+ax3.set_xlabel('Test F1 — macro (%)', fontsize=10)
+ax3.set_title(f'TEST F1 Ranking — All Classifiers\n{FEAT_LABEL}', fontweight='bold')
+ax3.grid(axis='x', alpha=0.3)
+for i, (bar, val) in enumerate(zip(ax3.patches, sorted_f1s)):
+    ax3.text(val+0.8, bar.get_y()+bar.get_height()/2,
+             f'{val:.2f}%', va='center', fontsize=9, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f'/content/test_f1_ranking_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_f1_ranking_{SAVE_TAG}.png')
+
+# ── Plot 4 — TEST Accuracy bar ────────────────────────────────────────────────
+acc_vals = [master_results[cn]['TEST']['acc']*100 for cn in clf_names]
+bar_cols = plt.cm.RdYlGn(np.linspace(0.3, 0.9, n_models))
+fig4, ax4 = plt.subplots(figsize=(12, 5))
+bars = ax4.bar(np.arange(n_models), acc_vals, color=bar_cols, edgecolor='white', width=0.5)
+for bar, val in zip(bars, acc_vals):
+    ax4.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+             f'{val:.2f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+best_idx = int(np.argmax(acc_vals))
+bars[best_idx].set_edgecolor('gold'); bars[best_idx].set_linewidth(2.5)
+ax4.text(best_idx, max(acc_vals)+3, f'★ Best\n{clf_names[best_idx]}',
+         ha='center', fontsize=8, color='goldenrod', fontweight='bold')
+ax4.set_xticks(np.arange(n_models))
+ax4.set_xticklabels(clf_names, fontsize=10, rotation=12, ha='right')
+ax4.set_ylim(0, 115); ax4.set_ylabel('Accuracy (%)', fontsize=11)
+ax4.set_title(f'TEST Accuracy — All Classifiers\n{FEAT_LABEL} '
+              f'Train={N_TRAIN} Val={N_VAL} Test={N_TEST}',
+              fontsize=12, fontweight='bold')
+ax4.grid(axis='y', alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig(f'/content/test_accuracy_{SAVE_TAG}.png', dpi=150, bbox_inches='tight')
+Image(f'/content/test_accuracy_{SAVE_TAG}.png')
+
+# ── Final summary table ───────────────────────────────────────────────────────
+split_names = ['TRAIN','VAL','TEST']
+print(f"\n{'═'*100}")
+print(f"  FINAL COMPARISON TABLE")
+print(f"  Feature : {FEAT_LABEL}")
+print(f"  Quant   : Scheme 1 (1-bit sign) | SNR range {SNR_MIN}–{SNR_MAX} dB")
+print(f"{'═'*100}")
+header = f"  {'Model':<20}"
+for s in split_names:
+    header += f"  {s+' Acc':>9} {s+' F1':>9}"
+print(header); print(f"  {'-'*92}")
+for cn in clf_names:
+    row = f"  {cn:<20}"
+    for s in split_names:
+        r = master_results[cn][s]
+        row += f"  {r['acc']*100:>8.2f}% {r['f1']*100:>8.2f}%"
+    print(row)
+
+print(f"\n{'─'*100}")
+print(f"  OVERFIT CHECK (Train Acc − Val Acc)")
+for cn in clf_names:
+    gap  = master_results[cn]['TRAIN']['acc'] - master_results[cn]['VAL']['acc']
+    flag = ('✅ No overfit' if abs(gap)<0.05 else
+            '⚠️ Slight'    if abs(gap)<0.10 else '❌ Overfit')
+    print(f"  {cn:<20} {gap*100:>+7.2f}%  {flag}")
+
+print(f"\n  BEST TEST F1  → {sorted_names[0]}  ({sorted_f1s[0]:.2f}%)")
+print(f"{'═'*100}")
+print(f"\n✅ All done!")
+
+
+
