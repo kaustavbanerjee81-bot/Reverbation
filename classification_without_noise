@@ -1,0 +1,1296 @@
+#02/06/2026  —  MULTI-SCHEME × MULTI-MODEL VERSION
+
+# ════════════════════════════════════════════════════════
+# CELL 0  Libraries and  import of  drive
+# ════════════════════════════════════════════════════════
+!pip install pyroomacoustics soundfile librosa -q
+
+import os, glob
+import numpy as np
+import librosa
+import pyroomacoustics as pra
+from collections import defaultdict
+from google.colab import drive
+
+drive.mount('/content/drive')
+print("✅ Imports done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 1 — STEP 1: EXPLORE DATASET   (UNCHANGED)
+# ════════════════════════════════════════════════════════
+
+SPLIT_BASE = '/content/drive/MyDrive/DATASET_IISC/SAMPLE_WAV_SPLIT'
+
+TRAIN_WAV_DIR = os.path.join(SPLIT_BASE, 'train')
+VAL_WAV_DIR   = os.path.join(SPLIT_BASE, 'val')
+TEST_WAV_DIR  = os.path.join(SPLIT_BASE, 'test')
+
+train_files = sorted(glob.glob(os.path.join(TRAIN_WAV_DIR, '**', '*.wav'), recursive=True))
+val_files   = sorted(glob.glob(os.path.join(VAL_WAV_DIR,   '**', '*.wav'), recursive=True))
+test_files  = sorted(glob.glob(os.path.join(TEST_WAV_DIR,  '**', '*.wav'), recursive=True))
+
+all_wav = train_files + val_files + test_files
+print(f"Train={len(train_files)}  Val={len(val_files)}  Test={len(test_files)}  Total={len(all_wav)}")
+print("✅ Step 1 done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 2 — STEP 2: CHOOSE HOW MANY FILES TO USE  (UNCHANGED)
+# ════════════════════════════════════════════════════════
+
+N_TRAIN = 1000
+N_VAL   = 100
+N_TEST  = 100
+SEED    = 42
+
+assert N_TRAIN <= len(train_files)
+assert N_VAL   <= len(val_files)
+assert N_TEST  <= len(test_files)
+
+import random
+rng = random.Random(SEED)
+
+tr = train_files.copy(); rng.shuffle(tr); train_chosen = tr[:N_TRAIN]
+vl = val_files.copy();   rng.shuffle(vl); val_chosen   = vl[:N_VAL]
+te = test_files.copy();  rng.shuffle(te); test_chosen  = te[:N_TEST]
+
+print(f"Chosen → train={len(train_chosen)} val={len(val_chosen)} test={len(test_chosen)}")
+print("✅ Step 2 done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3A — WRITE speech_quantization.py   (UNCHANGED)
+# ════════════════════════════════════════════════════════
+
+quant_code = '''
+import numpy as np
+
+MU = 255
+A  = 87.6
+
+def normalise(x):
+    x    = np.asarray(x, dtype=np.float64)
+    peak = np.max(np.abs(x))
+    return x if peak == 0.0 else x / peak
+
+def mu_law_compress(x, mu=MU):
+    x = np.clip(x, -1.0, 1.0)
+    return np.sign(x) * np.log1p(mu * np.abs(x)) / np.log1p(mu)
+
+def a_law_compress(x, a=A):
+    x   = np.clip(x, -1.0, 1.0)
+    ax  = np.abs(x)
+    lna = np.log(a)
+    out = np.where(ax <= 1.0/a,
+                   a * ax / (1.0 + lna),
+                   (1.0 + np.log(a * ax + 1e-12)) / (1.0 + lna))
+    return np.sign(x) * np.clip(out, 0.0, 1.0)
+
+def _uniform_midtread(x, bit_depth):
+    delta = 2.0 ** (1 - bit_depth)
+    x_q   = delta * np.round(x / delta)
+    return np.clip(x_q, -(1.0 - delta/2.0), 1.0 - delta/2.0)
+
+def _log2_quantize(x, bit_depth):
+    x    = np.clip(x, -1.0, 1.0)
+    sign = np.sign(x)
+    mag  = np.abs(x)
+    eps      = 2.0 ** -(2 ** (bit_depth - 1))
+    log_mag  = np.log2(np.where(mag < eps, eps, mag))
+    log_min  = -float(2 ** (bit_depth - 1))
+    log_norm = np.clip(log_mag / (-log_min), 0.0, 1.0)
+    levels   = 2 ** (bit_depth - 1)
+    log_q    = np.round(log_norm * (levels - 1)) / (levels - 1)
+    mag_q    = 2.0 ** (log_q * log_min)
+    return np.where(sign == 0, 0.0, sign * mag_q)
+
+def quantize(x, scheme, bit_depth=1, mu=MU, a=A):
+    """
+    scheme 1 : 1-bit sign quantization        (bit_depth ignored)
+    scheme 2 : uniform midtread                (bit_depth in {2,4,8})
+    scheme 3 : mu-law + uniform                (bit_depth in {2,4,8})
+    scheme 4 : A-law  + uniform                (bit_depth in {2,4,8})
+    scheme 5 : log2 quantization               (bit_depth in {2,4,8})
+    scheme 6 : full precision (no quantization) (bit_depth ignored)
+    """
+    x = np.asarray(x, dtype=np.float64)
+    x = np.clip(x, -1.0, 1.0)
+    if scheme == 1:
+        return np.where(x > 0, 1.0, -1.0)
+    if scheme == 6:
+        return x.copy()
+    if scheme == 2:
+        return _uniform_midtread(x, bit_depth)
+    if scheme == 3:
+        return _uniform_midtread(mu_law_compress(x, mu), bit_depth)
+    if scheme == 4:
+        return _uniform_midtread(a_law_compress(x, a), bit_depth)
+    if scheme == 5:
+        return _log2_quantize(x, bit_depth)
+    raise ValueError(f"Unknown scheme: {scheme}")
+'''
+
+with open('/content/speech_quantization.py', 'w') as f:
+    f.write(quant_code)
+
+from speech_quantization import quantize, normalise
+print("✅ speech_quantization.py written and imported!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3B — DEREVERBERATION HELPER   (UNCHANGED)
+# ════════════════════════════════════════════════════════
+
+SR        = 16000
+SEED_BASE = 100
+
+derev_params = {
+    "t60_range"           : [0.4, 1.0],
+    "dim_range"           : [5, 15, 5, 15, 2, 6],
+    "min_distance_to_wall": 1.0
+}
+
+def apply_dereverberation(speech, seed):
+    np.random.seed(seed)
+
+    t60      = np.random.uniform(*derev_params["t60_range"])
+    room_dim = np.array([
+        np.random.uniform(derev_params["dim_range"][2*n],
+                          derev_params["dim_range"][2*n+1])
+        for n in range(3)
+    ])
+    center_mic = np.array([
+        np.random.uniform(derev_params["min_distance_to_wall"],
+                          room_dim[n] - derev_params["min_distance_to_wall"])
+        for n in range(3)
+    ])
+    source_pos = np.array([
+        np.random.uniform(derev_params["min_distance_to_wall"],
+                          room_dim[n] - derev_params["min_distance_to_wall"])
+        for n in range(3)
+    ])
+
+    mic_array_2d = pra.beamforming.circular_2D_array(
+                       center_mic[:-1], 1, phi0=0, radius=1.)
+    mic_array    = np.pad(mic_array_2d, ((0,1),(0,0)),
+                          mode='constant', constant_values=center_mic[-1])
+
+    e_abs, max_order = pra.inverse_sabine(t60, room_dim)
+
+    rev_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(e_abs),
+                           max_order=min(3, max_order), ray_tracing=True)
+    rev_room.set_ray_tracing()
+    rev_room.add_microphone_array(mic_array)
+    rev_room.add_source(source_pos, signal=speech)
+    rev_room.compute_rir()
+    rev_room.simulate()
+    t60_real     = np.mean(rev_room.measure_rt60()).squeeze()
+    lossy_speech = np.squeeze(np.array(rev_room.mic_array.signals))
+
+    dry_room = pra.ShoeBox(room_dim, fs=SR,
+                           materials=pra.Material(0.99), max_order=0)
+    dry_room.add_microphone_array(mic_array)
+    dry_room.add_source(source_pos, signal=speech)
+    dry_room.compute_rir()
+    dry_room.simulate()
+    speech_out = np.squeeze(np.array(dry_room.mic_array.signals))
+
+    noise_power  = (1/speech_out.shape[0]) * np.sum(speech_out**2) \
+                   * np.power(10, -50/10)
+    noise_signal = np.random.rand(int(.5*SR)) * np.sqrt(noise_power)
+    speech_out   = np.concatenate([speech_out, noise_signal])
+
+    min_len = min(lossy_speech.shape[0], speech_out.shape[0])
+    return speech_out[:min_len], lossy_speech[:min_len], t60_real
+
+print("✅ Dereverberation helper ready!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 3C — STEP 3: RUN REVERB SIMULATION ONCE PER FILE
+# (Expensive pyroomacoustics step — run ONCE, cache raw
+#  clean/reverb float signals to RAM. Quantization for every
+#  scheme/bit_depth happens later, cheaply, from this cache.)
+# ════════════════════════════════════════════════════════
+
+splits_wav = [
+    ('train', train_chosen),
+    ('val',   val_chosen),
+    ('test',  test_chosen),
+]
+
+# raw_cache[split] = list of dicts: {dr, spk, utt, t60, clean_raw, reverb_raw}
+raw_cache = {'train': [], 'val': [], 'test': []}
+
+total_files = N_TRAIN + N_VAL + N_TEST
+global_idx  = 0
+
+for split_name, file_list in splits_wav:
+    print(f"\n{'='*60}")
+    print(f"  {split_name.upper()} — {len(file_list)} files  (reverb simulation)")
+    print(f"{'='*60}")
+
+    for wav_path in file_list:
+        global_idx += 1
+        seed = SEED_BASE + global_idx
+
+        dr  = wav_path.split('/')[-3]
+        spk = wav_path.split('/')[-2]
+        utt = os.path.splitext(os.path.basename(wav_path))[0]
+
+        print(f"  [{global_idx:03d}/{total_files}] {spk}/{utt}  seed={seed}", end='  ')
+
+        speech, sr = librosa.load(wav_path, sr=SR, mono=True)
+        speech = speech.astype(np.float64)
+
+        try:
+            clean_raw, reverb_raw, t60 = apply_dereverberation(speech, seed)
+        except Exception as e:
+            print(f"⚠️ SKIPPED ({e})")
+            continue
+
+        raw_cache[split_name].append(dict(
+            dr=dr, spk=spk, utt=utt, t60=t60,
+            clean_raw=normalise(clean_raw),
+            reverb_raw=normalise(reverb_raw),
+        ))
+        print(f"T60={t60:.3f}s | len={len(clean_raw)}")
+
+print(f"\n✅ Step 3 done — raw signals cached in RAM "
+      f"(train={len(raw_cache['train'])}, val={len(raw_cache['val'])}, "
+      f"test={len(raw_cache['test'])})")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 4 — FEATURE EXTRACTION FUNCTIONS  (ZCR + Autocorr)
+# ════════════════════════════════════════════════════════
+
+N_LAGS     = 3
+N_FEATURES = 1 + N_LAGS
+
+def compute_zcr(signal):
+    sign = np.where(signal >= 0, 1, -1)
+    return np.sum(np.abs(sign[1:] - sign[:-1])) / 2 / (len(signal) - 1)
+
+def compute_normalized_autocorr(signal, n_lags=N_LAGS):
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    if energy == 0.0:
+        return np.zeros(n_lags, dtype=np.float64)
+    ac = np.zeros(n_lags, dtype=np.float64)
+    for k in range(1, n_lags + 1):
+        ac[k - 1] = np.sum(signal[:-k] * signal[k:]) / energy
+    return ac
+
+def compute_features(signal):
+    zcr = compute_zcr(signal)
+    ac  = compute_normalized_autocorr(signal, N_LAGS)
+    return np.concatenate([[zcr], ac])
+
+print(f"✅ Feature functions ready — {N_FEATURES} dims "
+      f"(ZCR + R(1)..R({N_LAGS}))")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 5 — DEFINE THE 14 QUANTIZATION CONFIGS + 5 MODELS
+# ════════════════════════════════════════════════════════
+
+# ── The 14 rows requested: scheme1, scheme{2,3,4,5}×bit{2,4,8}, scheme6 ──
+QUANT_CONFIGS = [('1', 1, None)]
+for scheme in [2, 3, 4, 5]:
+    for bd in [2, 4, 8]:
+        QUANT_CONFIGS.append((f'{scheme}_{bd}bit', scheme, bd))
+QUANT_CONFIGS.append(('6', 6, None))
+
+print("Quantization configs (rows):")
+for label, scheme, bd in QUANT_CONFIGS:
+    print(f"  {label:10s}  scheme={scheme}  bit_depth={bd}")
+
+# ── The 5 classification models ───────────────────────
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+def make_models():
+    return {
+        'SVM (RBF)'         : SVC(kernel='rbf', C=1.0, gamma='scale', random_state=SEED),
+        'Logistic Reg.'     : LogisticRegression(max_iter=2000, random_state=SEED),
+        'Random Forest'     : RandomForestClassifier(n_estimators=200, random_state=SEED),
+        'KNN (k=5)'         : KNeighborsClassifier(n_neighbors=5),
+        'Gradient Boosting' : GradientBoostingClassifier(random_state=SEED),
+    }
+
+MODEL_NAMES = list(make_models().keys())
+print(f"\nModels (5): {MODEL_NAMES}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 6 — MAIN LOOP: for each quant config → build features
+# → train all 5 models → record train/val/test accuracy
+# ════════════════════════════════════════════════════════
+
+def build_split_features(split_name, scheme, bit_depth):
+    """Quantize cached raw signals for this split/config, extract features."""
+    X, y = [], []
+    for item in raw_cache[split_name]:
+        if bit_depth is None:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme)
+        else:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme, bit_depth=bit_depth)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme, bit_depth=bit_depth)
+        X.extend([compute_features(clean_q), compute_features(reverb_q)])
+        y.extend([0, 1])
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+# results[config_label][model_name] = {'train':acc,'val':acc,'test':acc}
+results = {}
+
+print(f"\n{'='*70}")
+print(f"  RUNNING {len(QUANT_CONFIGS)} QUANT CONFIGS × {len(MODEL_NAMES)} MODELS")
+print(f"{'='*70}")
+
+for label, scheme, bit_depth in QUANT_CONFIGS:
+    print(f"\n▶ Config: {label}  (scheme={scheme}, bit_depth={bit_depth})")
+
+    X_train, y_train = build_split_features('train', scheme, bit_depth)
+    X_val,   y_val   = build_split_features('val',   scheme, bit_depth)
+    X_test,  y_test  = build_split_features('test',  scheme, bit_depth)
+
+    # shuffle train only
+    rng_tr = np.random.default_rng(seed=SEED)
+    idx = rng_tr.permutation(len(y_train))
+    X_train, y_train = X_train[idx], y_train[idx]
+
+    # scale — fit on train only
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_val_sc   = scaler.transform(X_val)
+    X_test_sc  = scaler.transform(X_test)
+
+    results[label] = {}
+    models = make_models()
+    for model_name, model in models.items():
+        model.fit(X_train_sc, y_train)
+        acc_train = accuracy_score(y_train, model.predict(X_train_sc))
+        acc_val   = accuracy_score(y_val,   model.predict(X_val_sc))
+        acc_test  = accuracy_score(y_test,  model.predict(X_test_sc))
+        results[label][model_name] = dict(train=acc_train, val=acc_val, test=acc_test)
+        print(f"    {model_name:18s}  Train={acc_train*100:5.1f}%  "
+              f"Val={acc_val*100:5.1f}%  Test={acc_test*100:5.1f}%")
+
+print(f"\n✅ All configs × models done!")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 7 — BUILD RESULTS TABLE (rows=configs, cols=model×split)
+# ════════════════════════════════════════════════════════
+
+import pandas as pd
+
+rows = []
+for label, _, _ in QUANT_CONFIGS:
+    row = {'Config': label}
+    for model_name in MODEL_NAMES:
+        r = results[label][model_name]
+        row[f'{model_name} - Train'] = round(r['train']*100, 2)
+        row[f'{model_name} - Val']   = round(r['val']*100, 2)
+        row[f'{model_name} - Test']  = round(r['test']*100, 2)
+    rows.append(row)
+
+df_results = pd.DataFrame(rows).set_index('Config')
+print(df_results)
+
+CSV_OUT = '/content/drive/MyDrive/DATASET_IISC/results_all_configs_all_models.csv'
+df_results.to_csv(CSV_OUT)
+print(f"\n✅ Results table saved → {CSV_OUT}")
+
+
+# ════════════════════════════════════════════════════════
+# CELL 8 — CHART: 5 panels (one per model), each showing
+# grouped Train/Val/Test bars across all 14 quant configs
+# ════════════════════════════════════════════════════════
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+config_labels = [c[0] for c in QUANT_CONFIGS]
+n_configs = len(config_labels)
+x = np.arange(n_configs)
+bar_w = 0.25
+
+fig, axes = plt.subplots(len(MODEL_NAMES), 1, figsize=(16, 4.2*len(MODEL_NAMES)))
+if len(MODEL_NAMES) == 1:
+    axes = [axes]
+
+split_colors = {'train': 'steelblue', 'val': 'seagreen', 'test': 'tomato'}
+
+for ax, model_name in zip(axes, MODEL_NAMES):
+    train_acc = [results[lbl][model_name]['train']*100 for lbl in config_labels]
+    val_acc   = [results[lbl][model_name]['val']*100   for lbl in config_labels]
+    test_acc  = [results[lbl][model_name]['test']*100  for lbl in config_labels]
+
+    ax.bar(x - bar_w, train_acc, width=bar_w, label='Train', color=split_colors['train'])
+    ax.bar(x,          val_acc,   width=bar_w, label='Val',   color=split_colors['val'])
+    ax.bar(x + bar_w,  test_acc,  width=bar_w, label='Test',  color=split_colors['test'])
+
+    ax.set_title(model_name, fontweight='bold', fontsize=12)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(0, 105)
+    ax.set_xticks(x)
+    ax.set_xticklabels(config_labels, rotation=45, ha='right')
+    ax.legend(fontsize=8, loc='lower right')
+    ax.grid(True, axis='y', alpha=0.3)
+
+fig.suptitle('Accuracy by Quantization Config × Model  (Train / Val / Test)',
+             fontsize=15, fontweight='bold', y=1.0)
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/DATASET_IISC/accuracy_chart_all_configs_all_models.png',
+            dpi=150, bbox_inches='tight')
+plt.show()
+# ════════════════════════════════════════════════════════
+# NEW CELL A — ZCR-ONLY FEATURE FUNCTION
+# (Paste as a NEW cell — reuses raw_cache already in memory,
+#  no need to rerun Cell 3C reverb simulation)
+# ════════════════════════════════════════════════════════
+
+def compute_zcr(signal):
+    sign = np.where(signal >= 0, 1, -1)
+    return np.sum(np.abs(sign[1:] - sign[:-1])) / 2 / (len(signal) - 1)
+
+def compute_features_zcr(signal):
+    """ZCR-only feature vector — shape (1,)"""
+    return np.array([compute_zcr(signal)])
+
+N_FEATURES_ZCR = 1
+
+print(f"✅ ZCR-only feature function ready — {N_FEATURES_ZCR} dim (just ZCR, no autocorr)")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL B — BUILD FEATURES (ZCR ONLY) FROM EXISTING raw_cache
+# Reuses: raw_cache, quantize, QUANT_CONFIGS, make_models, MODEL_NAMES, SEED
+# ════════════════════════════════════════════════════════
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+def build_split_features_zcr(split_name, scheme, bit_depth):
+    """Quantize cached raw signals for this split/config, extract ZCR-only features."""
+    X, y = [], []
+    for item in raw_cache[split_name]:
+        if bit_depth is None:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme)
+        else:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme, bit_depth=bit_depth)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme, bit_depth=bit_depth)
+        X.extend([compute_features_zcr(clean_q), compute_features_zcr(reverb_q)])
+        y.extend([0, 1])
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+# results_zcr[config_label][model_name] = {'train':acc,'val':acc,'test':acc}
+results_zcr = {}
+
+print(f"\n{'='*70}")
+print(f"  RUNNING {len(QUANT_CONFIGS)} QUANT CONFIGS × {len(MODEL_NAMES)} MODELS  (ZCR ONLY)")
+print(f"{'='*70}")
+
+for label, scheme, bit_depth in QUANT_CONFIGS:
+    print(f"\n▶ Config: {label}  (scheme={scheme}, bit_depth={bit_depth})")
+
+    X_train, y_train = build_split_features_zcr('train', scheme, bit_depth)
+    X_val,   y_val   = build_split_features_zcr('val',   scheme, bit_depth)
+    X_test,  y_test  = build_split_features_zcr('test',  scheme, bit_depth)
+
+    rng_tr = np.random.default_rng(seed=SEED)
+    idx = rng_tr.permutation(len(y_train))
+    X_train, y_train = X_train[idx], y_train[idx]
+
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_val_sc   = scaler.transform(X_val)
+    X_test_sc  = scaler.transform(X_test)
+
+    results_zcr[label] = {}
+    models = make_models()
+    for model_name, model in models.items():
+        model.fit(X_train_sc, y_train)
+        acc_train = accuracy_score(y_train, model.predict(X_train_sc))
+        acc_val   = accuracy_score(y_val,   model.predict(X_val_sc))
+        acc_test  = accuracy_score(y_test,  model.predict(X_test_sc))
+        results_zcr[label][model_name] = dict(train=acc_train, val=acc_val, test=acc_test)
+        print(f"    {model_name:18s}  Train={acc_train*100:5.1f}%  "
+              f"Val={acc_val*100:5.1f}%  Test={acc_test*100:5.1f}%")
+
+print(f"\n✅ ZCR-only run done for all configs × models!")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL C — RESULTS TABLE (ZCR ONLY)
+# ════════════════════════════════════════════════════════
+
+import pandas as pd
+
+rows_zcr = []
+for label, _, _ in QUANT_CONFIGS:
+    row = {'Config': label}
+    for model_name in MODEL_NAMES:
+        r = results_zcr[label][model_name]
+        row[f'{model_name} - Train'] = round(r['train']*100, 2)
+        row[f'{model_name} - Val']   = round(r['val']*100, 2)
+        row[f'{model_name} - Test']  = round(r['test']*100, 2)
+    rows_zcr.append(row)
+
+df_results_zcr = pd.DataFrame(rows_zcr).set_index('Config')
+print(df_results_zcr)
+
+CSV_OUT_ZCR = '/content/drive/MyDrive/DATASET_IISC/results_all_configs_all_models_ZCR_ONLY.csv'
+df_results_zcr.to_csv(CSV_OUT_ZCR)
+print(f"\n✅ ZCR-only results table saved → {CSV_OUT_ZCR}")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL D — CHART (ZCR ONLY): 5 panels, Train/Val/Test bars
+# ════════════════════════════════════════════════════════
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+config_labels = [c[0] for c in QUANT_CONFIGS]
+n_configs = len(config_labels)
+x = np.arange(n_configs)
+bar_w = 0.25
+
+fig, axes = plt.subplots(len(MODEL_NAMES), 1, figsize=(16, 4.2*len(MODEL_NAMES)))
+if len(MODEL_NAMES) == 1:
+    axes = [axes]
+
+split_colors = {'train': 'steelblue', 'val': 'seagreen', 'test': 'tomato'}
+
+for ax, model_name in zip(axes, MODEL_NAMES):
+    train_acc = [results_zcr[lbl][model_name]['train']*100 for lbl in config_labels]
+    val_acc   = [results_zcr[lbl][model_name]['val']*100   for lbl in config_labels]
+    test_acc  = [results_zcr[lbl][model_name]['test']*100  for lbl in config_labels]
+
+    ax.bar(x - bar_w, train_acc, width=bar_w, label='Train', color=split_colors['train'])
+    ax.bar(x,          val_acc,   width=bar_w, label='Val',   color=split_colors['val'])
+    ax.bar(x + bar_w,  test_acc,  width=bar_w, label='Test',  color=split_colors['test'])
+
+    ax.set_title(f"{model_name} (ZCR only)", fontweight='bold', fontsize=12)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(0, 105)
+    ax.set_xticks(x)
+    ax.set_xticklabels(config_labels, rotation=45, ha='right')
+    ax.legend(fontsize=8, loc='lower right')
+    ax.grid(True, axis='y', alpha=0.3)
+
+fig.suptitle('Accuracy by Quantization Config × Model — ZCR-only feature  (Train / Val / Test)',
+             fontsize=15, fontweight='bold', y=1.0)
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/DATASET_IISC/accuracy_chart_ZCR_ONLY.png',
+            dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\n✅ ZCR-only chart saved → "
+      "/content/drive/MyDrive/DATASET_IISC/accuracy_chart_ZCR_ONLY.png")
+print("\n✅ ALL DONE — ZCR-only table (CSV) + chart (PNG) saved to Drive.")
+
+print("\n✅ Chart saved → "
+      "/content/drive/MyDrive/DATASET_IISC/accuracy_chart_all_configs_all_models.png")
+print("\n✅ ALL DONE — table (CSV) + chart (PNG) saved to Drive.")
+# ════════════════════════════════════════════════════════
+# NEW CELL A2 — ZCR + mean ACR(1-3) + mean LTTC(1-3) FEATURES
+# (Paste as a NEW cell — reuses raw_cache already in memory,
+#  no need to rerun Cell 3C reverb simulation)
+#
+# Feature vector (3 dims):
+#   [0] ZCR
+#   [1] mean short-term autocorrelation, lags 1,2,3 (sample-level)
+#   [2] mean long-term temporal correlation, "lags" 1,2,3
+#       — each long-term lag = k * LTTC_LAG_STEP samples
+#       — LTTC_LAG_STEP defaults to 80 samples (~5 ms @ 16kHz),
+#         inside the typical speech pitch-period range.
+#         EDIT THIS if you meant a different long-term window.
+# ════════════════════════════════════════════════════════
+
+LTTC_LAG_STEP = 80   # samples per long-term "lag" step (~5ms @ 16kHz) — EDIT if needed
+N_SHORT_LAGS  = 3    # ACR lags: 1, 2, 3
+N_LONG_LAGS   = 3    # LTTC lags: LTTC_LAG_STEP*1, *2, *3
+
+def compute_zcr(signal):
+    sign = np.where(signal >= 0, 1, -1)
+    return np.sum(np.abs(sign[1:] - sign[:-1])) / 2 / (len(signal) - 1)
+
+def _normalized_autocorr_at_lags(signal, lags):
+    """R(k) = sum(x[t]*x[t+k]) / sum(x[t]^2), for each k in lags."""
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    out = np.zeros(len(lags), dtype=np.float64)
+    if energy == 0.0:
+        return out
+    for i, k in enumerate(lags):
+        if k >= len(signal):
+            out[i] = 0.0
+            continue
+        out[i] = np.sum(signal[:-k] * signal[k:]) / energy
+    return out
+
+def compute_features_zcr_acr_lttc(signal):
+    """
+    Returns 3-dim feature vector:
+      [ZCR, mean_ACR(1..3), mean_LTTC(1..3)]
+    """
+    zcr = compute_zcr(signal)
+
+    short_lags = list(range(1, N_SHORT_LAGS + 1))               # [1, 2, 3]
+    long_lags  = [LTTC_LAG_STEP * k for k in range(1, N_LONG_LAGS + 1)]  # [80, 160, 240]
+
+    acr_vals  = _normalized_autocorr_at_lags(signal, short_lags)
+    lttc_vals = _normalized_autocorr_at_lags(signal, long_lags)
+
+    mean_acr  = np.mean(acr_vals)
+    mean_lttc = np.mean(lttc_vals)
+
+    return np.array([zcr, mean_acr, mean_lttc])
+
+N_FEATURES_ZAL = 3
+FEATURE_NAMES_ZAL = ['ZCR', 'mean_ACR(1-3)', 'mean_LTTC(1-3)']
+
+print(f"✅ Feature function ready — {N_FEATURES_ZAL} dims: {FEATURE_NAMES_ZAL}")
+print(f"   Short-term ACR lags: 1, 2, 3 (samples)")
+print(f"   Long-term LTTC lags: {LTTC_LAG_STEP}, {2*LTTC_LAG_STEP}, {3*LTTC_LAG_STEP} (samples)")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL B2 — BUILD FEATURES FROM EXISTING raw_cache
+# Reuses: raw_cache, quantize, QUANT_CONFIGS, make_models, MODEL_NAMES, SEED
+# ════════════════════════════════════════════════════════
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+def build_split_features_zal(split_name, scheme, bit_depth):
+    """Quantize cached raw signals for this split/config, extract ZCR+ACR+LTTC features."""
+    X, y = [], []
+    for item in raw_cache[split_name]:
+        if bit_depth is None:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme)
+        else:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme, bit_depth=bit_depth)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme, bit_depth=bit_depth)
+        X.extend([compute_features_zcr_acr_lttc(clean_q), compute_features_zcr_acr_lttc(reverb_q)])
+        y.extend([0, 1])
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+# results_zal[config_label][model_name] = {'train':acc,'val':acc,'test':acc}
+results_zal = {}
+
+print(f"\n{'='*70}")
+print(f"  RUNNING {len(QUANT_CONFIGS)} QUANT CONFIGS × {len(MODEL_NAMES)} MODELS  (ZCR + ACR + LTTC)")
+print(f"{'='*70}")
+
+for label, scheme, bit_depth in QUANT_CONFIGS:
+    print(f"\n▶ Config: {label}  (scheme={scheme}, bit_depth={bit_depth})")
+
+    X_train, y_train = build_split_features_zal('train', scheme, bit_depth)
+    X_val,   y_val   = build_split_features_zal('val',   scheme, bit_depth)
+    X_test,  y_test  = build_split_features_zal('test',  scheme, bit_depth)
+
+    rng_tr = np.random.default_rng(seed=SEED)
+    idx = rng_tr.permutation(len(y_train))
+    X_train, y_train = X_train[idx], y_train[idx]
+
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_val_sc   = scaler.transform(X_val)
+    X_test_sc  = scaler.transform(X_test)
+
+    results_zal[label] = {}
+    models = make_models()
+    for model_name, model in models.items():
+        model.fit(X_train_sc, y_train)
+        acc_train = accuracy_score(y_train, model.predict(X_train_sc))
+        acc_val   = accuracy_score(y_val,   model.predict(X_val_sc))
+        acc_test  = accuracy_score(y_test,  model.predict(X_test_sc))
+        results_zal[label][model_name] = dict(train=acc_train, val=acc_val, test=acc_test)
+        print(f"    {model_name:18s}  Train={acc_train*100:5.1f}%  "
+              f"Val={acc_val*100:5.1f}%  Test={acc_test*100:5.1f}%")
+
+print(f"\n✅ ZCR+ACR+LTTC run done for all configs × models!")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL C2 — RESULTS TABLE (ZCR + ACR + LTTC)
+# ════════════════════════════════════════════════════════
+
+import pandas as pd
+
+rows_zal = []
+for label, _, _ in QUANT_CONFIGS:
+    row = {'Config': label}
+    for model_name in MODEL_NAMES:
+        r = results_zal[label][model_name]
+        row[f'{model_name} - Train'] = round(r['train']*100, 2)
+        row[f'{model_name} - Val']   = round(r['val']*100, 2)
+        row[f'{model_name} - Test']  = round(r['test']*100, 2)
+    rows_zal.append(row)
+
+df_results_zal = pd.DataFrame(rows_zal).set_index('Config')
+print(df_results_zal)
+
+CSV_OUT_ZAL = '/content/drive/MyDrive/DATASET_IISC/results_all_configs_all_models_ZCR_ACR_LTTC.csv'
+df_results_zal.to_csv(CSV_OUT_ZAL)
+print(f"\n✅ ZCR+ACR+LTTC results table saved → {CSV_OUT_ZAL}")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL D2 — CHART (ZCR + ACR + LTTC): 5 panels, Train/Val/Test
+# ════════════════════════════════════════════════════════
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+config_labels = [c[0] for c in QUANT_CONFIGS]
+n_configs = len(config_labels)
+x = np.arange(n_configs)
+bar_w = 0.25
+
+fig, axes = plt.subplots(len(MODEL_NAMES), 1, figsize=(16, 4.2*len(MODEL_NAMES)))
+if len(MODEL_NAMES) == 1:
+    axes = [axes]
+
+split_colors = {'train': 'steelblue', 'val': 'seagreen', 'test': 'tomato'}
+
+for ax, model_name in zip(axes, MODEL_NAMES):
+    train_acc = [results_zal[lbl][model_name]['train']*100 for lbl in config_labels]
+    val_acc   = [results_zal[lbl][model_name]['val']*100   for lbl in config_labels]
+    test_acc  = [results_zal[lbl][model_name]['test']*100  for lbl in config_labels]
+
+    ax.bar(x - bar_w, train_acc, width=bar_w, label='Train', color=split_colors['train'])
+    ax.bar(x,          val_acc,   width=bar_w, label='Val',   color=split_colors['val'])
+    ax.bar(x + bar_w,  test_acc,  width=bar_w, label='Test',  color=split_colors['test'])
+
+    ax.set_title(f"{model_name} (ZCR + mean ACR(1-3) + mean LTTC(1-3))",
+                 fontweight='bold', fontsize=11)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(0, 105)
+    ax.set_xticks(x)
+    ax.set_xticklabels(config_labels, rotation=45, ha='right')
+    ax.legend(fontsize=8, loc='lower right')
+    ax.grid(True, axis='y', alpha=0.3)
+
+fig.suptitle('Accuracy by Quantization Config × Model — ZCR + mean ACR(1-3) + mean LTTC(1-3)',
+             fontsize=14, fontweight='bold', y=1.0)
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/DATASET_IISC/accuracy_chart_ZCR_ACR_LTTC.png',
+            dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\n✅ ZCR+ACR+LTTC chart saved → "
+      "/content/drive/MyDrive/DATASET_IISC/accuracy_chart_ZCR_ACR_LTTC.png")
+print("\n✅ ALL DONE — table (CSV) + chart (PNG) saved to Drive.")
+# ════════════════════════════════════════════════════════
+# NEW CELL A3 — ZCR + mean ACR(1-3) + spectral centroid + spectral rolloff
+# (Paste as a NEW cell — reuses raw_cache already in memory,
+#  no need to rerun Cell 3C reverb simulation)
+#
+# Feature vector (4 dims):
+#   [0] ZCR
+#   [1] mean short-term autocorrelation, lags 1,2,3 (sample-level)
+#   [2] Spectral centroid (Hz)   — "center of mass" of the magnitude spectrum
+#   [3] Spectral rolloff (Hz)    — freq below which 85% of spectral energy sits
+#
+# Both spectral features are computed on the FULL signal's FFT
+# (not frame-by-frame), to stay consistent with how ZCR/ACR are
+# computed over the whole utterance elsewhere in this pipeline.
+# Edit ROLLOFF_PERCENT below if you want a different threshold
+# (85% is the standard default used in most audio libraries).
+# ════════════════════════════════════════════════════════
+
+ROLLOFF_PERCENT = 0.85   # fraction of total spectral energy — EDIT if needed
+N_SHORT_LAGS    = 3      # ACR lags: 1, 2, 3
+
+def compute_zcr(signal):
+    sign = np.where(signal >= 0, 1, -1)
+    return np.sum(np.abs(sign[1:] - sign[:-1])) / 2 / (len(signal) - 1)
+
+def _normalized_autocorr_at_lags(signal, lags):
+    """R(k) = sum(x[t]*x[t+k]) / sum(x[t]^2), for each k in lags."""
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    out = np.zeros(len(lags), dtype=np.float64)
+    if energy == 0.0:
+        return out
+    for i, k in enumerate(lags):
+        if k >= len(signal):
+            out[i] = 0.0
+            continue
+        out[i] = np.sum(signal[:-k] * signal[k:]) / energy
+    return out
+
+def compute_spectral_centroid(signal, sr=SR):
+    """
+    Spectral centroid = weighted mean frequency, weighted by magnitude spectrum.
+    Higher = more high-frequency energy ("brighter" sound).
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    mag    = np.abs(np.fft.rfft(signal))
+    freqs  = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    total  = np.sum(mag)
+    if total == 0.0:
+        return 0.0
+    return float(np.sum(freqs * mag) / total)
+
+def compute_spectral_rolloff(signal, sr=SR, roll_percent=ROLLOFF_PERCENT):
+    """
+    Spectral rolloff = frequency below which `roll_percent` of the total
+    spectral energy (magnitude) is contained.
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    mag    = np.abs(np.fft.rfft(signal))
+    freqs  = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    total  = np.sum(mag)
+    if total == 0.0:
+        return 0.0
+    cumulative = np.cumsum(mag)
+    threshold  = roll_percent * total
+    idx        = np.searchsorted(cumulative, threshold)
+    idx        = min(idx, len(freqs) - 1)
+    return float(freqs[idx])
+
+def compute_features_zcr_acr_spectral(signal):
+    """
+    Returns 4-dim feature vector:
+      [ZCR, mean_ACR(1..3), spectral_centroid_Hz, spectral_rolloff_Hz]
+    """
+    zcr = compute_zcr(signal)
+
+    short_lags = list(range(1, N_SHORT_LAGS + 1))  # [1, 2, 3]
+    acr_vals   = _normalized_autocorr_at_lags(signal, short_lags)
+    mean_acr   = np.mean(acr_vals)
+
+    centroid = compute_spectral_centroid(signal, sr=SR)
+    rolloff  = compute_spectral_rolloff(signal, sr=SR, roll_percent=ROLLOFF_PERCENT)
+
+    return np.array([zcr, mean_acr, centroid, rolloff])
+
+N_FEATURES_ZAS = 4
+FEATURE_NAMES_ZAS = ['ZCR', 'mean_ACR(1-3)', 'spectral_centroid_Hz', 'spectral_rolloff_Hz']
+
+print(f"✅ Feature function ready — {N_FEATURES_ZAS} dims: {FEATURE_NAMES_ZAS}")
+print(f"   ACR lags: 1, 2, 3 (samples)")
+print(f"   Spectral rolloff threshold: {ROLLOFF_PERCENT*100:.0f}% of total energy")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL B3 — BUILD FEATURES FROM EXISTING raw_cache
+# Reuses: raw_cache, quantize, QUANT_CONFIGS, make_models, MODEL_NAMES, SEED
+# ════════════════════════════════════════════════════════
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+def build_split_features_zas(split_name, scheme, bit_depth):
+    """Quantize cached raw signals for this split/config, extract ZCR+ACR+spectral features."""
+    X, y = [], []
+    for item in raw_cache[split_name]:
+        if bit_depth is None:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme)
+        else:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme, bit_depth=bit_depth)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme, bit_depth=bit_depth)
+        X.extend([compute_features_zcr_acr_spectral(clean_q),
+                   compute_features_zcr_acr_spectral(reverb_q)])
+        y.extend([0, 1])
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+# results_zas[config_label][model_name] = {'train':acc,'val':acc,'test':acc}
+results_zas = {}
+
+print(f"\n{'='*70}")
+print(f"  RUNNING {len(QUANT_CONFIGS)} QUANT CONFIGS × {len(MODEL_NAMES)} MODELS  "
+      f"(ZCR + ACR + Spectral Centroid + Rolloff)")
+print(f"{'='*70}")
+
+for label, scheme, bit_depth in QUANT_CONFIGS:
+    print(f"\n▶ Config: {label}  (scheme={scheme}, bit_depth={bit_depth})")
+
+    X_train, y_train = build_split_features_zas('train', scheme, bit_depth)
+    X_val,   y_val   = build_split_features_zas('val',   scheme, bit_depth)
+    X_test,  y_test  = build_split_features_zas('test',  scheme, bit_depth)
+
+    rng_tr = np.random.default_rng(seed=SEED)
+    idx = rng_tr.permutation(len(y_train))
+    X_train, y_train = X_train[idx], y_train[idx]
+
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_val_sc   = scaler.transform(X_val)
+    X_test_sc  = scaler.transform(X_test)
+
+    results_zas[label] = {}
+    models = make_models()
+    for model_name, model in models.items():
+        model.fit(X_train_sc, y_train)
+        acc_train = accuracy_score(y_train, model.predict(X_train_sc))
+        acc_val   = accuracy_score(y_val,   model.predict(X_val_sc))
+        acc_test  = accuracy_score(y_test,  model.predict(X_test_sc))
+        results_zas[label][model_name] = dict(train=acc_train, val=acc_val, test=acc_test)
+        print(f"    {model_name:18s}  Train={acc_train*100:5.1f}%  "
+              f"Val={acc_val*100:5.1f}%  Test={acc_test*100:5.1f}%")
+
+print(f"\n✅ ZCR+ACR+Spectral run done for all configs × models!")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL C3 — RESULTS TABLE (ZCR + ACR + Spectral Centroid + Rolloff)
+# ════════════════════════════════════════════════════════
+
+import pandas as pd
+
+rows_zas = []
+for label, _, _ in QUANT_CONFIGS:
+    row = {'Config': label}
+    for model_name in MODEL_NAMES:
+        r = results_zas[label][model_name]
+        row[f'{model_name} - Train'] = round(r['train']*100, 2)
+        row[f'{model_name} - Val']   = round(r['val']*100, 2)
+        row[f'{model_name} - Test']  = round(r['test']*100, 2)
+    rows_zas.append(row)
+
+df_results_zas = pd.DataFrame(rows_zas).set_index('Config')
+print(df_results_zas)
+
+CSV_OUT_ZAS = '/content/drive/MyDrive/DATASET_IISC/results_all_configs_all_models_ZCR_ACR_SPECTRAL.csv'
+df_results_zas.to_csv(CSV_OUT_ZAS)
+print(f"\n✅ ZCR+ACR+Spectral results table saved → {CSV_OUT_ZAS}")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL D3 — CHART: 5 panels, Train/Val/Test bars
+# ════════════════════════════════════════════════════════
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+config_labels = [c[0] for c in QUANT_CONFIGS]
+n_configs = len(config_labels)
+x = np.arange(n_configs)
+bar_w = 0.25
+
+fig, axes = plt.subplots(len(MODEL_NAMES), 1, figsize=(16, 4.2*len(MODEL_NAMES)))
+if len(MODEL_NAMES) == 1:
+    axes = [axes]
+
+split_colors = {'train': 'steelblue', 'val': 'seagreen', 'test': 'tomato'}
+
+for ax, model_name in zip(axes, MODEL_NAMES):
+    train_acc = [results_zas[lbl][model_name]['train']*100 for lbl in config_labels]
+    val_acc   = [results_zas[lbl][model_name]['val']*100   for lbl in config_labels]
+    test_acc  = [results_zas[lbl][model_name]['test']*100  for lbl in config_labels]
+
+    ax.bar(x - bar_w, train_acc, width=bar_w, label='Train', color=split_colors['train'])
+    ax.bar(x,          val_acc,   width=bar_w, label='Val',   color=split_colors['val'])
+    ax.bar(x + bar_w,  test_acc,  width=bar_w, label='Test',  color=split_colors['test'])
+
+    ax.set_title(f"{model_name} (ZCR + mean ACR(1-3) + centroid + rolloff)",
+                 fontweight='bold', fontsize=10.5)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(0, 105)
+    ax.set_xticks(x)
+    ax.set_xticklabels(config_labels, rotation=45, ha='right')
+    ax.legend(fontsize=8, loc='lower right')
+    ax.grid(True, axis='y', alpha=0.3)
+
+fig.suptitle('Accuracy by Quantization Config × Model — '
+             'ZCR + mean ACR(1-3) + Spectral Centroid + Spectral Rolloff',
+             fontsize=13.5, fontweight='bold', y=1.0)
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/DATASET_IISC/accuracy_chart_ZCR_ACR_SPECTRAL.png',
+            dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\n✅ ZCR+ACR+Spectral chart saved → "
+      "/content/drive/MyDrive/DATASET_IISC/accuracy_chart_ZCR_ACR_SPECTRAL.png")
+print("\n✅ ALL DONE — table (CSV) + chart (PNG) saved to Drive.")
+# ════════════════════════════════════════════════════════
+# NEW CELL A4 — ZCR + mean ACR(1-3) + Spectral Centroid +
+#               Spectral Rolloff(85%) + Spectral Entropy + Spectral Flatness
+# (Paste as a NEW cell — reuses raw_cache already in memory,
+#  no need to rerun Cell 3C reverb simulation)
+#
+# Feature vector (6 dims):
+#   [0] ZCR
+#   [1] mean_ACR(1-3)        — mean normalized autocorrelation, lags 1,2,3
+#   [2] spectral_centroid_Hz — weighted mean freq of magnitude spectrum
+#   [3] spectral_rolloff_Hz  — freq below which 85% of spectral energy sits
+#   [4] spectral_entropy     — Shannon entropy of the (normalized) power
+#                              spectrum, itself normalized to [0,1] by
+#                              log2(N_bins). High = noise-like/flat energy
+#                              spread across freq (reverb tends to raise
+#                              this); low = concentrated/tonal energy.
+#   [5] spectral_flatness    — geometric mean / arithmetic mean of the
+#                              power spectrum ("Wiener entropy"), in (0,1].
+#                              ~1 = white-noise-like (flat spectrum);
+#                              ~0 = tonal/peaky spectrum.
+#
+# All spectral features computed on the FULL signal's FFT (not
+# frame-by-frame), consistent with how ZCR/ACR are computed
+# elsewhere in this pipeline.
+# ════════════════════════════════════════════════════════
+
+ROLLOFF_PERCENT = 0.85   # fraction of total spectral energy — EDIT if needed
+N_SHORT_LAGS    = 3      # ACR lags: 1, 2, 3
+SPEC_EPS        = 1e-12  # numerical floor to avoid log(0)
+
+def compute_zcr(signal):
+    sign = np.where(signal >= 0, 1, -1)
+    return np.sum(np.abs(sign[1:] - sign[:-1])) / 2 / (len(signal) - 1)
+
+def _normalized_autocorr_at_lags(signal, lags):
+    """R(k) = sum(x[t]*x[t+k]) / sum(x[t]^2), for each k in lags."""
+    signal = np.asarray(signal, dtype=np.float64)
+    energy = np.sum(signal ** 2)
+    out = np.zeros(len(lags), dtype=np.float64)
+    if energy == 0.0:
+        return out
+    for i, k in enumerate(lags):
+        if k >= len(signal):
+            out[i] = 0.0
+            continue
+        out[i] = np.sum(signal[:-k] * signal[k:]) / energy
+    return out
+
+def _magnitude_spectrum(signal):
+    signal = np.asarray(signal, dtype=np.float64)
+    return np.abs(np.fft.rfft(signal))
+
+def compute_spectral_centroid(signal, sr=SR):
+    """Weighted mean frequency, weighted by magnitude spectrum."""
+    mag   = _magnitude_spectrum(signal)
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    total = np.sum(mag)
+    if total == 0.0:
+        return 0.0
+    return float(np.sum(freqs * mag) / total)
+
+def compute_spectral_rolloff(signal, sr=SR, roll_percent=ROLLOFF_PERCENT):
+    """Frequency below which `roll_percent` of total spectral energy sits."""
+    mag   = _magnitude_spectrum(signal)
+    freqs = np.fft.rfftfreq(len(signal), d=1.0/sr)
+    total = np.sum(mag)
+    if total == 0.0:
+        return 0.0
+    cumulative = np.cumsum(mag)
+    threshold  = roll_percent * total
+    idx        = np.searchsorted(cumulative, threshold)
+    idx        = min(idx, len(freqs) - 1)
+    return float(freqs[idx])
+
+def compute_spectral_entropy(signal):
+    """
+    Shannon entropy of the normalized power spectrum, scaled to [0,1]
+    by dividing by log2(number of frequency bins with nonzero power).
+    """
+    mag   = _magnitude_spectrum(signal)
+    power = mag ** 2
+    total = np.sum(power)
+    if total == 0.0:
+        return 0.0
+    psd = power / total
+    psd = psd[psd > 0]
+    if len(psd) <= 1:
+        return 0.0
+    entropy = -np.sum(psd * np.log2(psd))
+    return float(entropy / np.log2(len(psd)))
+
+def compute_spectral_flatness(signal):
+    """
+    Geometric mean / arithmetic mean of the power spectrum ("Wiener entropy").
+    ~1 = flat/noise-like spectrum, ~0 = peaky/tonal spectrum.
+    """
+    mag   = _magnitude_spectrum(signal)
+    power = mag ** 2 + SPEC_EPS
+    geo_mean   = np.exp(np.mean(np.log(power)))
+    arith_mean = np.mean(power)
+    if arith_mean == 0.0:
+        return 0.0
+    return float(geo_mean / arith_mean)
+
+def compute_features_full6(signal):
+    """
+    Returns 6-dim feature vector:
+      [ZCR, mean_ACR(1..3), spectral_centroid_Hz, spectral_rolloff_Hz,
+       spectral_entropy, spectral_flatness]
+    """
+    zcr = compute_zcr(signal)
+
+    short_lags = list(range(1, N_SHORT_LAGS + 1))  # [1, 2, 3]
+    acr_vals   = _normalized_autocorr_at_lags(signal, short_lags)
+    mean_acr   = np.mean(acr_vals)
+
+    centroid = compute_spectral_centroid(signal, sr=SR)
+    rolloff  = compute_spectral_rolloff(signal, sr=SR, roll_percent=ROLLOFF_PERCENT)
+    entropy  = compute_spectral_entropy(signal)
+    flatness = compute_spectral_flatness(signal)
+
+    return np.array([zcr, mean_acr, centroid, rolloff, entropy, flatness])
+
+N_FEATURES_FULL6 = 6
+FEATURE_NAMES_FULL6 = ['ZCR', 'mean_ACR(1-3)', 'spectral_centroid_Hz',
+                        'spectral_rolloff_Hz', 'spectral_entropy', 'spectral_flatness']
+
+print(f"✅ Feature function ready — {N_FEATURES_FULL6} dims: {FEATURE_NAMES_FULL6}")
+print(f"   ACR lags: 1, 2, 3 (samples)")
+print(f"   Spectral rolloff threshold: {ROLLOFF_PERCENT*100:.0f}% of total energy")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL B4 — BUILD FEATURES FROM EXISTING raw_cache
+# Reuses: raw_cache, quantize, QUANT_CONFIGS, make_models, MODEL_NAMES, SEED
+# ════════════════════════════════════════════════════════
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+def build_split_features_full6(split_name, scheme, bit_depth):
+    """Quantize cached raw signals for this split/config, extract all 6 features."""
+    X, y = [], []
+    for item in raw_cache[split_name]:
+        if bit_depth is None:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme)
+        else:
+            clean_q  = quantize(item['clean_raw'],  scheme=scheme, bit_depth=bit_depth)
+            reverb_q = quantize(item['reverb_raw'], scheme=scheme, bit_depth=bit_depth)
+        X.extend([compute_features_full6(clean_q), compute_features_full6(reverb_q)])
+        y.extend([0, 1])
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+
+# results_full6[config_label][model_name] = {'train':acc,'val':acc,'test':acc}
+results_full6 = {}
+
+print(f"\n{'='*70}")
+print(f"  RUNNING {len(QUANT_CONFIGS)} QUANT CONFIGS × {len(MODEL_NAMES)} MODELS  "
+      f"(ZCR + ACR + Centroid + Rolloff + Entropy + Flatness)")
+print(f"{'='*70}")
+
+for label, scheme, bit_depth in QUANT_CONFIGS:
+    print(f"\n▶ Config: {label}  (scheme={scheme}, bit_depth={bit_depth})")
+
+    X_train, y_train = build_split_features_full6('train', scheme, bit_depth)
+    X_val,   y_val   = build_split_features_full6('val',   scheme, bit_depth)
+    X_test,  y_test  = build_split_features_full6('test',  scheme, bit_depth)
+
+    rng_tr = np.random.default_rng(seed=SEED)
+    idx = rng_tr.permutation(len(y_train))
+    X_train, y_train = X_train[idx], y_train[idx]
+
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_val_sc   = scaler.transform(X_val)
+    X_test_sc  = scaler.transform(X_test)
+
+    results_full6[label] = {}
+    models = make_models()
+    for model_name, model in models.items():
+        model.fit(X_train_sc, y_train)
+        acc_train = accuracy_score(y_train, model.predict(X_train_sc))
+        acc_val   = accuracy_score(y_val,   model.predict(X_val_sc))
+        acc_test  = accuracy_score(y_test,  model.predict(X_test_sc))
+        results_full6[label][model_name] = dict(train=acc_train, val=acc_val, test=acc_test)
+        print(f"    {model_name:18s}  Train={acc_train*100:5.1f}%  "
+              f"Val={acc_val*100:5.1f}%  Test={acc_test*100:5.1f}%")
+
+print(f"\n✅ Full 6-feature run done for all configs × models!")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL C4 — RESULTS TABLE (full 6-feature set)
+# ════════════════════════════════════════════════════════
+
+import pandas as pd
+
+rows_full6 = []
+for label, _, _ in QUANT_CONFIGS:
+    row = {'Config': label}
+    for model_name in MODEL_NAMES:
+        r = results_full6[label][model_name]
+        row[f'{model_name} - Train'] = round(r['train']*100, 2)
+        row[f'{model_name} - Val']   = round(r['val']*100, 2)
+        row[f'{model_name} - Test']  = round(r['test']*100, 2)
+    rows_full6.append(row)
+
+df_results_full6 = pd.DataFrame(rows_full6).set_index('Config')
+print(df_results_full6)
+
+CSV_OUT_FULL6 = '/content/drive/MyDrive/DATASET_IISC/results_all_configs_all_models_FULL6.csv'
+df_results_full6.to_csv(CSV_OUT_FULL6)
+print(f"\n✅ Full 6-feature results table saved → {CSV_OUT_FULL6}")
+
+
+# ════════════════════════════════════════════════════════
+# NEW CELL D4 — CHART: 5 panels, Train/Val/Test bars
+# ════════════════════════════════════════════════════════
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+config_labels = [c[0] for c in QUANT_CONFIGS]
+n_configs = len(config_labels)
+x = np.arange(n_configs)
+bar_w = 0.25
+
+fig, axes = plt.subplots(len(MODEL_NAMES), 1, figsize=(16, 4.2*len(MODEL_NAMES)))
+if len(MODEL_NAMES) == 1:
+    axes = [axes]
+
+split_colors = {'train': 'steelblue', 'val': 'seagreen', 'test': 'tomato'}
+
+for ax, model_name in zip(axes, MODEL_NAMES):
+    train_acc = [results_full6[lbl][model_name]['train']*100 for lbl in config_labels]
+    val_acc   = [results_full6[lbl][model_name]['val']*100   for lbl in config_labels]
+    test_acc  = [results_full6[lbl][model_name]['test']*100  for lbl in config_labels]
+
+    ax.bar(x - bar_w, train_acc, width=bar_w, label='Train', color=split_colors['train'])
+    ax.bar(x,          val_acc,   width=bar_w, label='Val',   color=split_colors['val'])
+    ax.bar(x + bar_w,  test_acc,  width=bar_w, label='Test',  color=split_colors['test'])
+
+    ax.set_title(f"{model_name} (ZCR+ACR+Centroid+Rolloff+Entropy+Flatness)",
+                 fontweight='bold', fontsize=9.5)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_ylim(0, 105)
+    ax.set_xticks(x)
+    ax.set_xticklabels(config_labels, rotation=45, ha='right')
+    ax.legend(fontsize=8, loc='lower right')
+    ax.grid(True, axis='y', alpha=0.3)
+
+fig.suptitle('Accuracy by Quantization Config × Model — Full 6-feature set '
+             '(ZCR, mean ACR(1-3), Centroid, Rolloff, Entropy, Flatness)',
+             fontsize=12.5, fontweight='bold', y=1.0)
+plt.tight_layout()
+plt.savefig('/content/drive/MyDrive/DATASET_IISC/accuracy_chart_FULL6.png',
+            dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\n✅ Full 6-feature chart saved → "
+      "/content/drive/MyDrive/DATASET_IISC/accuracy_chart_FULL6.png")
+print("\n✅ ALL DONE — table (CSV) + chart (PNG) saved to Drive.")
