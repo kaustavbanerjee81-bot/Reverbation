@@ -51,4 +51,4 @@ README.md
 
 **Kaustav Banerjee**  
 Department of Electrical Engineering  
-Indian Institute of Science (IISc), Bangalore
+SPIRE Lab Indian Institute of Science (IISc), Bangalore
